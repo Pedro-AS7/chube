@@ -200,6 +200,10 @@ mudanças, marcadas no topo de cada arquivo:
   só elas usam esses cinzas, conferido na 2.1.303) vira uma faixa branca a 50% com texto preto em todos os temas
   (`USER_MESSAGE_BG`/`USER_MESSAGE_FG`). Sem isso, a mensagem quase não se distinguia.
 
+- caracteres duplicados (2026-11-12): no GNOME/Wayland os caracteres que o IBus monta (ç, ã, á, à, â...) chegam
+  como tecla pressionada **e** como `input_method::Event::Commit`, e saíam em dobro ("çç"). O `echo_guard.rs`
+  (com testes) descarta o segundo quando o outro caminho trouxe o mesmo texto há até 50 ms. Só o caminho sem
+  modificadores das teclas passa por ele. Testado só com `cargo test`; a digitação real fica com o usuário.
 `term/mod.rs` substitui o que esses arquivos usavam do cosmic-term (`Config` com os valores padrão de lá, `MenuState`,
 `Action`, que aqui é o `shortcuts::Shortcut`) e tem `spawn()`. Os eventos do PTY chegam por um canal único (`Message::TermEventTx` /
 `TermEvent`), tratados em `App::handle_term_event` como no `Message::TermEvent` do cosmic-term.

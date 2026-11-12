@@ -53,6 +53,7 @@ use std::{
 
 use super::{
     Action, MenuState,
+    echo_guard::{EchoGuard, Source as EchoSource},
     terminal::{Metadata, Terminal, TerminalScroll},
 };
 
@@ -1244,7 +1245,10 @@ where
                         if !character.is_control() {
                             let mut buf = [0, 0, 0, 0];
                             let str = character.encode_utf8(&mut buf);
-                            terminal.input_scroll(str.as_bytes().to_vec());
+                            // Chube: o IBus pode já ter mandado este caractere como commit.
+                            if state.echo_guard.should_write(EchoSource::Key, str, Instant::now()) {
+                                terminal.input_scroll(str.as_bytes().to_vec());
+                            }
                             shell.capture_event();
                         }
                     }
@@ -1267,7 +1271,10 @@ where
                 }
                 input_method::Event::Commit(text) => {
                     if state.is_focused {
-                        terminal.paste(text.to_string());
+                        // Chube: ç, ã, á... chegam também como tecla pressionada; não escrever duas vezes.
+                        if state.echo_guard.should_write(EchoSource::Commit, text, Instant::now()) {
+                            terminal.paste(text.to_string());
+                        }
                         shell.capture_event();
                     }
                 }
@@ -1991,6 +1998,8 @@ pub struct State {
     scrollbar_rect: Cell<Rectangle<f32>>,
     autoscroll: DragAutoscroll,
     preedit: Option<input_method::Preedit>,
+    /// Chube: descarta o caractere repetido entre a tecla e o commit do IBus.
+    echo_guard: EchoGuard,
 }
 
 impl State {
@@ -2007,6 +2016,7 @@ impl State {
             scrollbar_rect: Cell::new(Rectangle::default()),
             autoscroll: DragAutoscroll::new(AUTOSCROLL_INTERVAL),
             preedit: None,
+            echo_guard: EchoGuard::default(),
         }
     }
 }

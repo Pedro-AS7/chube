@@ -5,6 +5,7 @@
 //! este módulo substitui o que eles usavam do resto do app: configuração, menu de contexto
 //! e atalhos.
 
+mod echo_guard;
 mod mouse_reporter;
 #[allow(dead_code)]
 mod terminal;
