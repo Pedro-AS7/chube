@@ -12,7 +12,7 @@ herdadas do ambiente ao iniciar os chats.
 Até 2026-11-13 era um app do COSMIC/GNOME, com 9 temas próprios e uma extensão do GNOME para o desfoque; a migração para o
 Omarchy (branch `omarchy`) trocou isso pelo tema do Omarchy e acrescentou o agente do Omarchy e as sessões da VPS.
 
-## Migração para GTK4 + VTE (branch `gtk`, em andamento desde 2026-11-14)
+## Migração para GTK4 + VTE (2026-11-14)
 
 **Por quê:** no libcosmic (iced), cada evento de mouse custa CPU fixa e cada mudança de hover redesenha a janela inteira,
 inclusive o texto dos terminais. Medido com um mouse virtual (uinput, 4 s de movimento, ticks de CPU de 10 ms, mesmo
@@ -33,7 +33,7 @@ de mensagem, que estava fora da tela desde o `29b1144`) saíram; estão no hist�
 
 **Portado (etapas 1 a 3):** tudo o que a versão libcosmic fazia, menos o fundo das mensagens do `claude` recolorido pelo
 tema (o VTE não remapeia uma cor RGB; o `claude` pinta a faixa com `rgb(55,55,55)`) e o campo de mensagem.
-Ainda não instalado: o `~/.local/bin/chube` continua sendo a versão libcosmic até o merge.
+Merge da `gtk` na `omarchy` e instalado pelo `./install.sh` em 2026-11-14.
 
 **Testar sem mexer no app aberto:** `XDG_STATE_HOME=<pasta> dbus-run-session -- target/release/chube`, com o link
 `<pasta>/omarchy` → `~/.local/state/omarchy`. O `dbus-run-session` separa a instância única; ao fechar, a cópia do
