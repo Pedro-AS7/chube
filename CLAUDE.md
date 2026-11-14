@@ -251,6 +251,20 @@ seleção do tema e a 255 = texto do tema (as outras são as do xterm), então t
 (`/proc/<pid>/task/<pid>/children`), usado no `~/.claude/sessions/<pid>.json`. O "continuar no terminal do Omarchy" não usa
 o filtro. Testes: o reescritor (inclusive sequência cortada entre leituras) e, em `tests/filtro.rs`, o binário de verdade.
 
+**Copiar e colar no terminal (`shortcuts::clipboard` + `ui::clipboard_key`, 2026-11-14).** O VTE não traz atalho de
+copiar/colar. Na captura da janela, com foco num `vte4::Terminal`: Ctrl+Shift+C copia, Ctrl+Shift+V e Shift+Insert colam;
+Ctrl+C e Ctrl+Insert copiam **só se houver seleção** (e a limpam), senão seguem como interrupção; Ctrl+V cola o texto, a não
+ser que a área de transferência tenha `image/*`, quando segue para o `claude` colar a imagem. É o que faz o Super+C/V do
+Omarchy funcionar: ele manda Ctrl+C/V (não Ctrl+Shift) a janelas sem a tag `terminal`, e o C-hub não tem essa tag (ela
+traria a transparência do Hyprland por cima do vidro do app). Testado: unidade das teclas; as teclas na janela, não.
+
+**Copiar de uma VPS (OSC 52, no filtro, 2026-11-14).** O VTE ignora o OSC 52 (`ESC ] 52 ; <seleção> ; <base64> BEL` ou
+`ESC \`), e é por ele que o `/copy` do `claude` dentro do tmux da VPS ("copied to tmux buffer"; o tmux de lá tem
+`set-clipboard on`) manda o texto para cá. O filtro tira essa sequência do fluxo, decodifica o base64 e entrega ao `wl-copy`
+numa thread (`--primary` se a seleção for só `p`); consultas (`?`) e base64 inválido somem sem copiar; acima de 16 MB passa
+como veio. Vale só para os chats do Claude (os do Codex e as abas de terminal não passam pelo filtro). Testado: unidade
+(inclusive cortado entre leituras em todas as posições) e o binário com `wl-copy`/`wl-paste` de verdade.
+
 ## Agente do Omarchy (2026-11-13)
 
 - No painel de nova sessão, **omarchy (claude)** abre o agente padrão do Omarchy (`omarchy-default-agent`, lido ao abrir o app)

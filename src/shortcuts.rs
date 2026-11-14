@@ -41,6 +41,40 @@ pub const LIST: [(&str, Shortcut); 7] = [
     ("Ctrl+Shift+↓", Shortcut::NextChat),
 ];
 
+/// Copiar e colar num terminal. O VTE não traz atalho para isso (cada app define os seus). O
+/// Super+C/V do Omarchy manda Ctrl+C/V para janelas que ele não marca como terminal (é o caso do
+/// C-hub), então os dois também valem aqui, sem tirar o Ctrl+C de interromper nem o Ctrl+V de colar
+/// imagem no `claude`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Clipboard {
+    /// Ctrl+Shift+C: copia a seleção (sem seleção, não faz nada).
+    Copy,
+    /// Ctrl+C e Ctrl+Insert: copia se houver seleção; senão a tecla segue para o programa.
+    CopyIfSelected,
+    /// Ctrl+Shift+V e Shift+Insert: cola o texto da área de transferência.
+    Paste,
+    /// Ctrl+V: cola o texto, a não ser que a área de transferência tenha imagem; aí a tecla segue
+    /// para o programa (o `claude` lê a imagem sozinho no Ctrl+V).
+    PasteUnlessImage,
+}
+
+/// A ação de copiar/colar de uma tecla pressionada num terminal, se houver.
+pub fn clipboard(keyval: Key, state: ModifierType) -> Option<Clipboard> {
+    let state = state & (ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK);
+    let ctrl = ModifierType::CONTROL_MASK;
+    let shift = ModifierType::SHIFT_MASK;
+    let ctrl_shift = ctrl | shift;
+    match (keyval.to_lower(), state) {
+        (Key::c, s) if s == ctrl_shift => Some(Clipboard::Copy),
+        (Key::v, s) if s == ctrl_shift => Some(Clipboard::Paste),
+        (Key::c, s) if s == ctrl => Some(Clipboard::CopyIfSelected),
+        (Key::v, s) if s == ctrl => Some(Clipboard::PasteUnlessImage),
+        (Key::Insert | Key::KP_Insert, s) if s == ctrl => Some(Clipboard::CopyIfSelected),
+        (Key::Insert | Key::KP_Insert, s) if s == shift => Some(Clipboard::Paste),
+        _ => None,
+    }
+}
+
 /// Teclas físicas (código do evdev + 8, como o GDK entrega) dos números: com Shift, o caractere
 /// muda conforme o layout, então os números valem pela tecla.
 const KEYCODE_1: u32 = 10;
@@ -90,5 +124,23 @@ mod tests {
         assert_eq!(find(Key::ISO_Left_Tab, 23, ModifierType::SHIFT_MASK), None);
         assert_eq!(find(Key::Down, 116, ctrl_shift), Some(Shortcut::NextChat));
         assert_eq!(find(Key::Down, 116, ModifierType::CONTROL_MASK), None);
+    }
+
+    #[test]
+    fn acha_copiar_e_colar() {
+        let ctrl = ModifierType::CONTROL_MASK;
+        let shift = ModifierType::SHIFT_MASK;
+        assert_eq!(clipboard(Key::C, ctrl | shift), Some(Clipboard::Copy));
+        assert_eq!(clipboard(Key::V, ctrl | shift | ModifierType::LOCK_MASK), Some(Clipboard::Paste));
+        assert_eq!(clipboard(Key::c, ctrl), Some(Clipboard::CopyIfSelected));
+        assert_eq!(clipboard(Key::v, ctrl), Some(Clipboard::PasteUnlessImage));
+        assert_eq!(clipboard(Key::Insert, ctrl), Some(Clipboard::CopyIfSelected));
+        assert_eq!(clipboard(Key::Insert, shift), Some(Clipboard::Paste));
+        assert_eq!(clipboard(Key::c, ModifierType::empty()), None);
+        assert_eq!(clipboard(Key::v, ctrl | ModifierType::ALT_MASK), None);
+        // Não colide com os atalhos do app.
+        for (keyval, state) in [(Key::c, ctrl | shift), (Key::v, ctrl | shift), (Key::c, ctrl), (Key::v, ctrl)] {
+            assert_eq!(find(keyval, 0, state), None);
+        }
     }
 }

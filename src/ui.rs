@@ -241,6 +241,19 @@ impl Ui {
         let open = panel_open.clone();
         let terminal_side = terminal_card.clone();
         keys.connect_key_pressed(move |controller, keyval, keycode, state| {
+            let focused_terminal = || {
+                controller
+                    .widget()
+                    .and_then(|window| window.root())
+                    .and_then(|root| root.focus())
+                    .and_then(|focus| focus.downcast::<vte4::Terminal>().ok())
+            };
+            if let Some(action) = shortcuts::clipboard(keyval, state)
+                && let Some(terminal) = focused_terminal()
+                && clipboard_key(&terminal, action)
+            {
+                return glib::Propagation::Stop;
+            }
             if let Some(shortcut) = shortcuts::find(keyval, keycode, state) {
                 let _ = sender.try_send(Message::Shortcut(shortcut));
                 return glib::Propagation::Stop;
@@ -826,6 +839,31 @@ fn page_name(id: TermId) -> String {
 }
 
 /// O terminal numa rolagem com a barra fina (sobreposta) do GTK.
+/// Copiar/colar no terminal em foco. Devolve se a tecla foi usada (senão ela segue para o programa).
+fn clipboard_key(terminal: &vte4::Terminal, action: shortcuts::Clipboard) -> bool {
+    use shortcuts::Clipboard;
+    use vte4::prelude::*;
+    match action {
+        Clipboard::Copy | Clipboard::CopyIfSelected if terminal.has_selection() => {
+            terminal.copy_clipboard_format(vte4::Format::Text);
+            // Sem seleção, o próximo Ctrl+C volta a interromper.
+            terminal.unselect_all();
+            true
+        }
+        Clipboard::Copy => true,
+        Clipboard::CopyIfSelected => false,
+        Clipboard::PasteUnlessImage
+            if terminal.clipboard().formats().mime_types().iter().any(|mime| mime.starts_with("image/")) =>
+        {
+            false
+        }
+        Clipboard::Paste | Clipboard::PasteUnlessImage => {
+            terminal.paste_clipboard();
+            true
+        }
+    }
+}
+
 fn terminal_page(terminal: &vte4::Terminal) -> gtk4::ScrolledWindow {
     gtk4::ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Never)

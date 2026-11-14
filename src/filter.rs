@@ -6,6 +6,10 @@
 //! comando num PTY próprio (como o `script`), repassa o teclado e a saída, e troca essas duas cores
 //! pelas entradas `MESSAGE_BG` e `MESSAGE_FG` da paleta de 256 cores, que o C-hub define com o tema
 //! (`terminal::apply_theme`). Trocar de tema recolore até as faixas que já estão na tela.
+//!
+//! O filtro também atende o OSC 52 (`ESC ] 52 ; <seleção> ; <base64> BEL`), que o VTE ignora: é
+//! por ele que o `/copy` do `claude` numa VPS (dentro do tmux) chega à área de transferência daqui.
+//! A sequência sai do fluxo e o texto vai para o `wl-copy`.
 
 use std::ffi::{CString, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -20,6 +24,27 @@ pub const MESSAGE_BG: u8 = 237;
 pub const MESSAGE_FG: u8 = 255;
 /// Sequências de escape maiores que isto não são de cor: passam sem ser olhadas.
 const MAX_SEQUENCE: usize = 256;
+/// Começo do OSC 52 (gravar na área de transferência).
+const OSC52: &[u8] = b"\x1b]52;";
+/// Um OSC 52 maior que isto (em base64) passa como veio, sem ser guardado inteiro na memória.
+const MAX_CLIPBOARD: usize = 16 * 1024 * 1024;
+
+/// Texto que o comando pediu para pôr na área de transferência (OSC 52).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Clip {
+    /// Só a seleção primária (`p`), a do botão do meio; senão, a área de transferência.
+    pub primary: bool,
+    pub text: Vec<u8>,
+}
+
+enum Osc52 {
+    /// Não é OSC 52 (ou está malformado): passa como veio.
+    Not,
+    /// Pode ser, mas o resto ainda não chegou.
+    Incomplete,
+    /// Sequência inteira de `length` bytes; `copy` é `None` para consultas (`?`) e base64 inválido.
+    Done { length: usize, copy: Option<Clip> },
+}
 
 /// Comando do terminal de um chat do Claude, passando pelo filtro.
 pub fn wrap(argv: Vec<String>) -> Vec<String> {
@@ -44,6 +69,8 @@ pub struct Rewriter {
     pending: Vec<u8>,
     /// Dentro da faixa: do fundo dela até outro fundo ou um reset.
     in_band: bool,
+    /// Pedidos de OSC 52 tirados do fluxo, para quem chamou entregar (`run` usa o `wl-copy`).
+    pub copies: Vec<Clip>,
 }
 
 impl Rewriter {
@@ -63,6 +90,25 @@ impl Rewriter {
                 self.pending = data[index..].to_vec();
                 return;
             };
+            if next == b']' {
+                match parse_osc52(&data[index..]) {
+                    Osc52::Not => {}
+                    Osc52::Incomplete if data.len() - index <= MAX_CLIPBOARD => {
+                        self.pending = data[index..].to_vec();
+                        return;
+                    }
+                    // Grande demais: passa como veio (o VTE ignora o OSC 52).
+                    Osc52::Incomplete => {
+                        output.extend_from_slice(&data[index..]);
+                        return;
+                    }
+                    Osc52::Done { length, copy } => {
+                        self.copies.extend(copy);
+                        index += length;
+                        continue;
+                    }
+                }
+            }
             if next != b'[' {
                 output.push(0x1b);
                 index += 1;
@@ -150,6 +196,91 @@ fn rewrite_sgr(params: &[u8], in_band: &mut bool) -> Vec<u8> {
         message_foreground(&mut out);
     }
     out.join(";").into_bytes()
+}
+
+/// Lê um OSC 52 no começo de `data` (que começa com `ESC ]`). Termina em BEL ou `ESC \\`.
+fn parse_osc52(data: &[u8]) -> Osc52 {
+    let known = data.len().min(OSC52.len());
+    if data[..known] != OSC52[..known] {
+        return Osc52::Not;
+    }
+    if data.len() < OSC52.len() {
+        return Osc52::Incomplete;
+    }
+    let body = &data[OSC52.len()..];
+    let mut at = 0;
+    while at < body.len() {
+        let terminator = match body[at] {
+            0x07 => 1,
+            0x1b => match body.get(at + 1) {
+                Some(b'\\') => 2,
+                Some(_) => return Osc52::Not,
+                None => return Osc52::Incomplete,
+            },
+            _ => {
+                at += 1;
+                continue;
+            }
+        };
+        let content = &body[..at];
+        let (selection, payload) = match content.iter().position(|&byte| byte == b';') {
+            Some(split) => (&content[..split], &content[split + 1..]),
+            None => (&b""[..], content),
+        };
+        let copy = (payload != b"?")
+            .then(|| decode_base64(payload))
+            .flatten()
+            .map(|text| Clip { primary: selection == b"p", text });
+        return Osc52::Done { length: OSC52.len() + at + terminator, copy };
+    }
+    Osc52::Incomplete
+}
+
+/// Base64 padrão (`A-Z a-z 0-9 + /`, com ou sem `=`); quebras de linha são ignoradas.
+fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(input.len() / 4 * 3);
+    let (mut buffer, mut bits) = (0u32, 0u32);
+    for &byte in input {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\r' | b'\n' => continue,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    Some(output)
+}
+
+/// Entrega um pedido de OSC 52 ao `wl-copy`, numa thread para não travar o fluxo do terminal.
+fn set_clipboard(copy: Clip) {
+    std::thread::spawn(move || {
+        let mut command = std::process::Command::new("wl-copy");
+        if copy.primary {
+            command.arg("--primary");
+        }
+        let child = command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Ok(mut child) = child {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(&copy.text);
+            }
+            let _ = child.wait();
+        }
+    });
 }
 
 fn colon_rgb(token: &str) -> Option<(u8, u8, u8)> {
@@ -273,6 +404,9 @@ pub fn run(args: &[OsString]) -> i32 {
                 output.clear();
                 rewriter.feed(&buffer[..read as usize], &mut output);
                 write_all(1, &output);
+                for copy in rewriter.copies.drain(..) {
+                    set_clipboard(copy);
+                }
             }
         }
         let mut status = 0;
@@ -343,6 +477,55 @@ mod tests {
         ] {
             assert_eq!(filter(&[input]), input, "{input:?}");
         }
+    }
+
+    fn copies(chunks: &[&[u8]]) -> (Vec<u8>, Vec<Clip>) {
+        let mut rewriter = Rewriter::default();
+        let mut output = Vec::new();
+        for chunk in chunks {
+            rewriter.feed(chunk, &mut output);
+        }
+        (output, rewriter.copies)
+    }
+
+    fn clipboard(text: &str) -> Clip {
+        Clip { primary: false, text: text.as_bytes().to_vec() }
+    }
+
+    #[test]
+    fn osc52_sai_do_fluxo_e_vira_copia() {
+        // "olá mundo" em base64, com os dois terminadores e a seleção vazia (como o tmux manda).
+        assert_eq!(copies(&[b"a\x1b]52;c;b2zDoSBtdW5kbw==\x07b"]), (b"ab".to_vec(), vec![clipboard("olá mundo")]));
+        assert_eq!(copies(&[b"\x1b]52;;b2zDoSBtdW5kbw\x1b\\"]), (Vec::new(), vec![clipboard("olá mundo")]));
+        assert_eq!(copies(&[b"\x1b]52;p;eA==\x07"]).1, vec![Clip { primary: true, text: b"x".to_vec() }]);
+        // Consulta e base64 inválido: saem do fluxo sem copiar nada.
+        assert_eq!(copies(&[b"\x1b]52;c;?\x07x"]), (b"x".to_vec(), Vec::new()));
+        assert_eq!(copies(&[b"\x1b]52;c;@@\x07x"]), (b"x".to_vec(), Vec::new()));
+        // Outros OSC e um 52 malformado passam como vieram.
+        assert_eq!(copies(&[b"\x1b]5;x\x07"]), (b"\x1b]5;x\x07".to_vec(), Vec::new()));
+        assert_eq!(copies(&[b"\x1b]52;c;eA\x1b[0m"]).1, Vec::new());
+    }
+
+    #[test]
+    fn osc52_cortado_entre_leituras() {
+        let whole = b"x\x1b]52;c;b2zDoSBtdW5kbw==\x1b\\\x1b[48;2;55;55;55my".as_slice();
+        for cut in 0..=whole.len() {
+            let (first, second) = whole.split_at(cut);
+            assert_eq!(
+                copies(&[first, second]),
+                (b"x\x1b[48;5;237;38;5;255my".to_vec(), vec![clipboard("olá mundo")]),
+                "corte em {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn base64() {
+        assert_eq!(decode_base64(b"").unwrap(), b"");
+        assert_eq!(decode_base64(b"YQ==").unwrap(), b"a");
+        assert_eq!(decode_base64(b"YWI=").unwrap(), b"ab");
+        assert_eq!(decode_base64(b"YWJj\nZA").unwrap(), b"abcd");
+        assert!(decode_base64(b"YW!j").is_none());
     }
 
     #[test]
