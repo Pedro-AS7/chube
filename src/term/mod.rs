@@ -18,10 +18,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
 use alacritty_terminal::term::color::Colors;
-use cosmic::cosmic_theme::palette::Srgba;
 use cosmic_text::{Metrics, Stretch};
 
-use crate::themes::Theme;
 
 pub use alacritty_terminal::event::Event;
 pub use terminal::Terminal;
@@ -62,9 +60,10 @@ pub struct Config {
 }
 
 impl Default for Config {
+    /// Fonte do tamanho da do terminal do Omarchy (o foot).
     fn default() -> Self {
         Self {
-            font_size: 14,
+            font_size: crate::themes::current().font_px as u16,
             font_weight: cosmic_text::Weight::NORMAL.0,
             dim_font_weight: cosmic_text::Weight::NORMAL.0,
             bold_font_weight: cosmic_text::Weight::BOLD.0,
@@ -83,40 +82,24 @@ impl Config {
         Stretch::Normal
     }
 
-    /// Paleta do tema do Chube em uso; no do sistema, a COSMIC Dark ou Light.
+    /// Uma paleta só: a do tema atual do Omarchy, refeita a cada troca de tema.
     pub fn syntax_theme(
         &self,
-        kind: ColorSchemeKind,
+        _kind: ColorSchemeKind,
         _profile_id: Option<ProfileId>,
     ) -> (String, ColorSchemeKind) {
-        match Theme::current() {
-            Theme::System => (theme_name(kind).to_owned(), kind),
-            theme => (theme.label().to_owned(), ColorSchemeKind::Dark),
-        }
+        (THEME_NAME.to_owned(), ColorSchemeKind::Dark)
     }
 }
 
-fn theme_name(kind: ColorSchemeKind) -> &'static str {
-    match kind {
-        ColorSchemeKind::Dark => "COSMIC Dark",
-        ColorSchemeKind::Light => "COSMIC Light",
-    }
-}
+const THEME_NAME: &str = "omarchy";
 
 pub fn themes() -> HashMap<(String, ColorSchemeKind), Colors> {
-    let mut themes = HashMap::from([
-        ((theme_name(ColorSchemeKind::Dark).to_owned(), ColorSchemeKind::Dark), terminal_theme::cosmic_dark()),
-        ((theme_name(ColorSchemeKind::Light).to_owned(), ColorSchemeKind::Light), terminal_theme::cosmic_light()),
-    ]);
-    for theme in Theme::ALL {
-        if let Some(palette) = theme.palette() {
-            themes.insert(
-                (theme.label().to_owned(), ColorSchemeKind::Dark),
-                terminal_theme::from_palette(&palette.terminal),
-            );
-        }
-    }
-    themes
+    let palette = crate::themes::current();
+    HashMap::from([(
+        (THEME_NAME.to_owned(), ColorSchemeKind::Dark),
+        terminal_theme::from_palette(&palette.colors),
+    )])
 }
 
 pub fn color_scheme_kind(theme: &cosmic::Theme) -> ColorSchemeKind {
@@ -127,18 +110,14 @@ pub fn color_scheme_kind(theme: &cosmic::Theme) -> ColorSchemeKind {
     }
 }
 
-/// Fundo padrão do terminal (o "sem cor" das aplicações): o do tema do Chube ou, no do
-/// sistema, o do COSMIC.
-pub fn set_background(theme: &cosmic::Theme) {
-    let rgb = match Theme::current().palette() {
-        Some(palette) => palette.terminal.background,
-        None => {
-            let color: Srgba = theme.cosmic().background(theme.transparent).base;
-            let bytes = cosmic::iced::Color::from(color).into_rgba8();
-            u32::from(bytes[2]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[0]) << 16)
-        }
-    };
-    terminal::WINDOW_BG_COLOR.store(rgb | 0xFF00_0000, Ordering::SeqCst);
+/// Fundo padrão do terminal (o "sem cor" das aplicações) e a faixa das mensagens do usuário
+/// na TUI do `claude`, com as cores do tema do Omarchy.
+pub fn set_background(_theme: &cosmic::Theme) {
+    let palette = crate::themes::current();
+    let colors = &palette.colors;
+    terminal::WINDOW_BG_COLOR.store(colors.background | 0xFF00_0000, Ordering::SeqCst);
+    terminal::USER_MESSAGE_BG.store(colors.selection | 0xFF00_0000, Ordering::SeqCst);
+    terminal::USER_MESSAGE_FG.store(colors.bright_foreground | 0xFF00_0000, Ordering::SeqCst);
 }
 
 /// Troca as cores de um terminal aberto pelas do tema em uso (`theme` é o do libcosmic).

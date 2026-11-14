@@ -1,6 +1,6 @@
 // Adaptado de cosmic-term (src/terminal_theme.rs), © System76, GPL-3.0-only.
-// Só as paletas COSMIC Dark/Light; temas em arquivo e exportação ficaram de fora.
-// `from_palette` (paletas dos temas do Chube) não existe no cosmic-term.
+// Só as paletas COSMIC Dark/Light (sem uso desde o tema do Omarchy); temas em arquivo e
+// exportação ficaram de fora. `from_palette` (cores do tema do Omarchy) não existe no cosmic-term.
 
 use alacritty_terminal::{
     term::color::Colors,
@@ -39,6 +39,7 @@ fn auto_colors() -> Colors {
     colors
 }
 
+#[allow(dead_code)]
 pub fn cosmic_dark() -> Colors {
     let mut colors = auto_colors();
 
@@ -87,6 +88,7 @@ pub fn cosmic_dark() -> Colors {
     colors
 }
 
+#[allow(dead_code)]
 pub fn cosmic_light() -> Colors {
     let mut colors = auto_colors();
 
@@ -135,8 +137,8 @@ pub fn cosmic_light() -> Colors {
     colors
 }
 
-/// Paleta de um tema do Chube. As cores apagadas (`Dim*`) são as normais a 2/3.
-pub fn from_palette(palette: &crate::themes::TerminalPalette) -> Colors {
+/// Paleta do tema do Omarchy. As cores apagadas (`Dim*`) são as normais a 2/3.
+pub fn from_palette(palette: &crate::omarchy::ThemeColors) -> Colors {
     let mut colors = auto_colors();
 
     let encode_rgb = |data: u32| -> Rgb {
@@ -192,8 +194,8 @@ pub fn from_palette(palette: &crate::themes::TerminalPalette) -> Colors {
     }
 
     colors[NamedColor::Foreground] = Some(encode_rgb(palette.foreground));
-    colors[NamedColor::Cursor] = Some(encode_rgb(palette.cursor));
-    colors[NamedColor::BrightForeground] = Some(encode_rgb(palette.foreground));
+    colors[NamedColor::Cursor] = Some(encode_rgb(palette.bright_foreground));
+    colors[NamedColor::BrightForeground] = Some(encode_rgb(palette.bright_foreground));
     colors[NamedColor::DimForeground] = Some(dim(palette.foreground));
 
     colors

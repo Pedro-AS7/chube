@@ -35,7 +35,7 @@ pub fn binary() -> PathBuf {
     candidates.into_iter().find(|p| p.is_file()).unwrap_or_else(|| PathBuf::from("codex"))
 }
 
-pub fn command(start: &Start, model: Option<&str>, prompt: Option<&str>) -> (String, Vec<String>) {
+pub fn command(start: &Start, model: Option<&str>, prompt: Option<&str>, auto: bool) -> (String, Vec<String>) {
     let bin = binary();
     let mut args: Vec<String> = ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_THREAD_ID", "CODEX_SESSION_ID"]
         .into_iter().flat_map(|key| ["-u".into(), key.into()]).collect();
@@ -48,16 +48,25 @@ pub fn command(start: &Start, model: Option<&str>, prompt: Option<&str>) -> (Str
         }
     }
     args.push(bin.display().to_string());
+    args.extend(self::args(start, model, prompt, auto));
+    ("env".into(), args)
+}
+
+/// Argumentos do `codex`, sem o binário (os mesmos aqui e na VPS). `auto` é o modo do
+/// `omarchy agent`: aprova sozinho (`--approve-for-me`).
+pub fn args(start: &Start, model: Option<&str>, prompt: Option<&str>, auto: bool) -> Vec<String> {
+    let mut args = Vec::new();
     match start {
         Start::New { .. } => {},
         Start::Resume { session_id } => args.extend(["resume".into(), session_id.clone()]),
         Start::Fork { parent_session_id } => args.extend(["fork".into(), parent_session_id.clone()]),
     }
+    if auto { args.push("--approve-for-me".into()); }
     // O título OSC identifica /new e /resume sem depender da largura ou do texto da conversa.
     args.extend(["-c".into(), "tui.terminal_title=[\"thread-id\"]".into()]);
     if let Some(model) = model { args.extend(["--model".into(), model.into()]); }
     if let Some(prompt) = prompt { args.extend(["--".into(), prompt.into()]); }
-    ("env".into(), args)
+    args
 }
 
 
@@ -148,7 +157,7 @@ fn summarize(reader: impl BufRead, modified: SystemTime) -> Option<SavedSession>
             break;
         }
     }
-    Some(SavedSession { agent: Agent::Codex, id: id?, cwd: cwd?, title: title.unwrap_or_else(|| "Codex".into()), modified, running: None })
+    Some(SavedSession { agent: Agent::Codex, id: id?, cwd: cwd?, title: title.unwrap_or_else(|| "Codex".into()), modified, running: None, host: None })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -226,13 +235,18 @@ mod tests {
             (Start::Resume { session_id: "abc".into() }, vec!["resume", "abc"]),
             (Start::Fork { parent_session_id: "abc".into() }, vec!["fork", "abc"]),
         ] {
-            let (program,args) = command(&start, Some("modelo"), Some("-oi"));
+            let (program,args) = command(&start, Some("modelo"), Some("-oi"), false);
             assert_eq!(program,"env");
             assert_eq!(&args[..4], ["-u","OPENAI_API_KEY","-u","CODEX_API_KEY"]);
             assert!(!args.iter().any(|arg| arg == "--session-id" || arg == "--resume" || arg.contains("bypass")));
             if !expected.is_empty() { assert!(args.windows(2).any(|w| w == expected.as_slice())); }
             assert_eq!(&args[args.len()-4..],["--model","modelo","--","-oi"]);
         }
+    }
+    #[test]
+    fn modo_omarchy_aprova_sozinho() {
+        let args = args(&Start::New { session_id: "x".into() }, None, None, true);
+        assert!(args.contains(&"--approve-for-me".to_owned()));
     }
     #[test]
     fn abbreviated_titles_require_unambiguous_session_identity() {

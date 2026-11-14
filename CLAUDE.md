@@ -1,9 +1,16 @@
 # C-hub (chube) — v0.1.0
 
-Nome visível: C-hub, desde 2026-10-23 (repositório github.com/Pedro-AS7/c-hub). Pasta, crate, binário `chube`, ID
-`com.pedro.Chube` e a extensão `desfoque-chube@pedro` mantêm o nome antigo, para não quebrar o que já está instalado.
+Nome visível: C-hub, desde 2026-10-23 (repositório github.com/Pedro-AS7/c-hub). Pasta, crate, binário `chube` e ID
+`com.pedro.Chube` mantêm o nome antigo, para não quebrar o que já está instalado.
 
-Chube é um app desktop para o COSMIC (Pop!_OS 24.04, Wayland) que **gerencia sessões do Claude Code e do Codex**: lista de chats ativos, cada um com o `claude` ou o `codex` interativo num terminal integrado, sessões salvas para retomar, sub-chats (fork de sessão), painel de consumo do plano e **terminal integrado com abas**. Usa o login existente de cada CLI; remove as chaves de API herdadas do ambiente ao iniciar os chats.
+Chube é um app desktop para o **Omarchy** (Arch + Hyprland) que **gerencia sessões do Claude Code e do Codex**, nesta máquina
+e **numa VPS por SSH**: lista de chats ativos, cada um com o `claude` ou o `codex` interativo num terminal integrado, chats no
+**modo do `omarchy agent`**, sessões salvas para retomar, sub-chats (fork de sessão), painel de consumo do plano e **terminal
+integrado com abas**. O visual segue o tema do Omarchy em uso. Usa o login existente de cada CLI; remove as chaves de API
+herdadas do ambiente ao iniciar os chats.
+
+Até 2026-11-13 era um app do COSMIC/GNOME, com 9 temas próprios e uma extensão do GNOME para o desfoque; a migração para o
+Omarchy (branch `omarchy`) trocou isso pelo tema do Omarchy e acrescentou o agente do Omarchy e as sessões da VPS.
 
 Rascunho da interface: `chub_racunho.png` (na raiz).
 
@@ -12,7 +19,7 @@ Projeto em português (Brasil). Comentários e UI em PT-BR; identificadores de c
 ## Stack
 
 - **Rust** (edition 2024) + **libcosmic** (git, fixado no commit `03d7dcb` de 2026-09-24 em `Cargo.toml`). O libcosmic usa um fork próprio do iced (`pop-os/iced`).
-- Features do libcosmic: `winit`, `tokio`, `wayland`, `wgpu`, `multi-window`, `dbus-config`, `xdg-portal`.
+- Features do libcosmic: `winit`, `tokio`, `wayland`, `wgpu`, `multi-window`, `dbus-config`, `xdg-portal`, `single-instance`.
   **Não** ligue `a11y`: o cosmic-term avisa que ela derruba o seletor de arquivos (usado em "Escolher pasta…").
 - **Claude Code** (CLI `claude`, testado na 2.1.283): cada chat é o `claude` interativo (a TUI) rodando num PTY.
 - **Terminal**: `alacritty_terminal` 0.25 + `cosmic-text` 0.19, código portado do **cosmic-term**. `cosmic-text` precisa ser a
@@ -27,10 +34,12 @@ Projeto em português (Brasil). Comentários e UI em PT-BR; identificadores de c
   (`res/com.pedro.Chube.svg` → `~/.local/share/icons/hicolor/scalable/apps/`) e `.desktop` (`res/com.pedro.Chube.desktop`
   → `~/.local/share/applications/com.pedro.Chube.desktop`, com o caminho absoluto do binário). Rodar de novo atualiza;
   `./install.sh --uninstall` remove. O nome do `.desktop` é o `APP_ID` da janela, que é como o dock liga os dois.
-- `cargo test` — testes do leitor do `/usage` e do `/context` (`src/usage.rs`), de `process_running` e `short_tokens` (`src/app.rs`), dos atalhos (`src/shortcuts.rs`), da lista de chats gravada (`src/restore.rs`), dos temas (`src/themes.rs`), do comando, do título e do modo em `src/claude.rs`,
+- `cargo test` — testes do leitor do `/usage` e do `/context` (`src/usage.rs`), de `process_running` e `short_tokens` (`src/app.rs`), dos atalhos (`src/shortcuts.rs`), da lista de chats gravada (`src/restore.rs`), da paleta (`src/themes.rs`),
+  do tema, da fonte, dos limites e da conta do Omarchy (`src/omarchy.rs`), dos hosts, das aspas, do comando do tmux e da lista da VPS (`src/remote.rs`),
+  dos chats da VPS e do tmux de fora (`src/chat.rs`), do comando, do título, do status pelo título e do modo em `src/claude.rs`,
   das sugestões de `/comandos` (`src/commands.rs`), do fundo das mensagens do `claude` (`src/term/terminal.rs`) e os que vieram do cosmic-term em `src/term/terminal_box.rs`.
-- Opções: `chube [--model <modelo>] [--prompt <mensagem>]`. `--model` vale para os chats novos; `--prompt` é passado ao `claude`
-  do primeiro chat, que já começa respondendo (útil para testar sem clicar).
+- Opções: `chube [--agent omarchy|claude|codex] [--model <modelo>] [--open-directory <pasta>] [-- <pastas>…]`. `--agent omarchy`
+  usa o agente padrão do Omarchy no modo do `omarchy agent`; `--model` vale para os chats novos desse agente.
 
 > Testes que falam com o modelo gastam o limite do plano Pro: use `--model haiku` e prompts curtos.
 
@@ -39,14 +48,19 @@ Projeto em português (Brasil). Comentários e UI em PT-BR; identificadores de c
 ```
 src/
   main.rs       Settings da janela e instância única via D-Bus
-  cli.rs        Argumentos (--agent, --model, --open-directory) e envio à instância aberta
+  cli.rs        Argumentos (--agent omarchy|claude|codex, --model, --open-directory) e envio à instância aberta
                 (também limpa as variáveis de sessão herdadas de um Claude Code pai e define
                 TERM/COLORTERM para os terminais: aberto pelo launcher, sem TERM o `claude` não tem cor)
   app.rs        App (cosmic::Application): layout em pane_grid (painel | chat | terminal), update/view,
-                diálogo de nova sessão, painel lateral de sessões salvas, painel "Uso", leitura periódica
-                do status dos chats (Message::Poll)
-  chat.rs       Chat (terminal com o `claude` + campo de mensagem, status/título/contexto/modo), Status;
-                new / resume / fork / reopen
+                painéis de nova sessão e de sessões (no lugar do chat), painel "uso", leitura periódica
+                do status dos chats (Message::Poll), conferência do tema do Omarchy (Message::CheckTheme)
+  chat.rs       Chat (terminal com o agente, status/título/contexto/modo, modo do Omarchy, host e tmux da VPS),
+                Status; new / resume / fork / reopen / attach e o comando do terminal (`Chat::command`)
+  agent.rs      Agent::{Claude,Codex}: comando local e só os argumentos (para a VPS)
+  codex.rs      Comando e histórico do Codex
+  omarchy.rs    O que vem do Omarchy: cores do tema, modo vidro, fonte do foot, fonte mono do fontconfig,
+                agente padrão, limites de uso e conta ativa (só leitura)
+  remote.rs     Sessões na VPS: hosts do ~/.ssh/config, comando ssh + tmux, lista das sessões e dos tmux de lá
   claude.rs     Comando do `claude` interativo, caminho do binário, título vindo do terminal, Mode
   commands.rs   Comandos `/…` sugeridos no campo de mensagem (do Claude Code, do usuário e do projeto)
   shortcuts.rs  Atalhos de teclado (tabela `KEY_BINDS`, também passada aos terminais)
@@ -55,11 +69,8 @@ src/
   dirs.rs       Resolve o diretório digitado: ".", "~", caminhos, atalhos do fshort (~/.shortcuts)
   usage.rs      Limites do plano via `/usage`
   restore.rs    Lista de chats abertos, gravada a cada mudança e reaberta ao iniciar
-  themes.rs     Temas (sistema, fósforo, neon, gruvbox, vidro, fumê, transparente, grafite, preto): paletas,
-                CosmicTheme de cada um, tema gravado, pedido de desfoque para a extensão do GNOME
+  themes.rs     Paleta do tema do Omarchy (num static, relida quando o tema muda) e o CosmicTheme dela
   term/         Terminal portado do cosmic-term (mod.rs substitui config, menu e atalhos de lá)
-gnome/
-  desfoque-chube@pedro/  Extensão do GNOME Shell: vidro fosco atrás da janela do Chube
 ```
 
 ## Integração com o Claude Code (`src/claude.rs`)
@@ -85,11 +96,12 @@ env -u ANTHROPIC_API_KEY claude (--session-id <uuid> | --resume <id> | --resume 
   (`--resume` do mesmo id, no mesmo lugar da lista).
 - O `[exit]` do cabeçalho e o `[x]` de cada item da lista "# chats" fecham o chat (descarta o `Terminal`: SIGHUP no `claude`). Sem nenhum chat, a seção central mostra
   "Nova sessão" / "Sessões salvas"; o código usa `self.chats.get(self.focused)`, nunca indexação direta.
-- `[term]` leva a sessão do chat em foco para o COSMIC Terminal: confere se já existe o `.jsonl`
+- O botão do terminal (``) leva a sessão do chat em foco para o terminal do Omarchy: confere se já existe o `.jsonl`
   (`sessions::session_file`; sessão nova sem mensagem não tem, e o `--resume` falharia), fecha o chat, espera o `claude`
   sair (`/proc/<pid>/stat`, zumbi conta como encerrado, até `EXIT_WAIT`) e roda
-  `cosmic-term --working-directory <pasta> -e env -u ANTHROPIC_API_KEY claude --resume <id> [--model <m>]`.
-  O `cosmic-term` se separa e sai logo. Falhas aparecem como aviso (`App::notice`) abaixo do cabeçalho do chat.
+  `omarchy-launch-tui --app-id=org.omarchy.agent sh -c 'cd "$0" && exec "$@"' <pasta> env -u ANTHROPIC_API_KEY claude --resume <id> […]`
+  (janela de agente, como as do `omarchy agent`; o `uwsm-app` não leva a pasta atual, por isso o `sh`). Num chat da VPS, a
+  janela nova entra no mesmo tmux. Falhas aparecem como aviso (`App::notice`) abaixo do cabeçalho do chat.
 
 ### Chats restaurados ao abrir (`src/restore.rs`)
 - O app abre sem chat novo: volta a lista da última execução, gravada em `$XDG_STATE_HOME/chube/chats.json`
@@ -100,7 +112,8 @@ env -u ANTHROPIC_API_KEY claude (--session-id <uuid> | --resume <id> | --resume 
 - Os chats voltam em espera (`Status::Suspended`, `-` "em espera"): só o do foco abre com `--resume`, os outros
   quando forem selecionados (`App::wake_focused`, também chamado depois de cada mensagem). Evita subir N `claude` de uma vez.
 - Sessão sem `.jsonl` (nenhuma mensagem, ou apagada pelo Claude Code) volta como chat novo na mesma pasta: o `--resume` falharia.
-- Testar sem mexer na lista real: `XDG_STATE_HOME=<pasta> cargo run`.
+- Testar sem mexer na lista real: `XDG_STATE_HOME=<pasta> cargo run`, com um link `<pasta>/omarchy` → `~/.local/state/omarchy`
+  (o Chube lê o tema e os limites do Omarchy no mesmo `XDG_STATE_HOME`; sem o link, cai no Starship de fábrica e no `/usage`).
 
 ### Campo de mensagem (fora da tela desde o commit 29b1144; o código ficou)
 - `text_editor` do libcosmic que cresce com o texto (até `COMPOSER_MAX_HEIGHT`, depois rola). Ao trocar de chat,
@@ -122,7 +135,7 @@ env -u ANTHROPIC_API_KEY claude (--session-id <uuid> | --resume <id> | --resume 
 
 | Tecla | Ação |
 |---|---|
-| Ctrl+Shift+N | Nova sessão (abre o diálogo) |
+| Ctrl+Shift+N | Nova sessão (abre o painel) |
 | Ctrl+Shift+1 / 2 / 3 | Mostrar/esconder painel, chat, terminal (chat e terminal não somem os dois) |
 | Ctrl+Tab | Foco do teclado: terminal do chat ↔ terminal integrado (mostra a seção se estiver escondida; sem aba, abre uma) |
 | Ctrl+Shift+↑ / ↓ | Chat de cima / de baixo na lista "# chats" (dá a volta nas pontas) |
@@ -146,9 +159,12 @@ env -u ANTHROPIC_API_KEY claude (--session-id <uuid> | --resume <id> | --resume 
   `claude::title_from_terminal` tira o símbolo e ignora `Claude Code`.
 
 ### Consumo do plano
-- `claude -p --no-session-persistence --output-format json "/usage"` roda o `/usage` **localmente**: 0 tokens, ~2,5 s,
-  não cria sessão salva. O texto (`Current session: 34% used · resets Sep 27, 12:50am (…)`) é lido em `usage.rs`.
-  O formato não é oficial: se mudar, o painel mostra "Erro ao atualizar" — ajuste `parse_line` e os testes.
+- Os limites vêm de `~/.local/state/omarchy/agents/usage/{claude,codex}.json`, que o Omarchy atualiza
+  (`omarchy agent usage update`): `limits[]` com `label`, `percent` (0–1) e `resetsAt`, mais `limitsFetchedAt` e
+  `limitsStale`. Lidos a cada `REFRESH_EVERY` (2 min) e no `[↻]`; o rodapé mostra a hora da leitura do Omarchy.
+- Sem esse arquivo, o Claude cai no `/usage`: `claude -p --no-session-persistence --output-format json "/usage"` roda
+  **localmente** (0 tokens, ~2,5 s, não cria sessão). O texto é lido em `usage.rs`; se o formato mudar, "erro ao atualizar".
+- A conta ativa (`Main (Pro)`) vem de `~/.local/state/omarchy/agents/accounts/claude.json`.
 
 ### Arquivos do Claude Code lidos pelo app
 - `~/.claude/projects/<dir-codificado>/<session-id>.jsonl` — **todas** as sessões ficam aqui, de qualquer diretório.
@@ -176,7 +192,8 @@ env -u ANTHROPIC_API_KEY claude (--session-id <uuid> | --resume <id> | --resume 
   nunca `auth.json`. Lê os últimos 512 KiB para modelo, contexto, tamanho da janela, limites e início/fim de tarefas.
   Os limites são os últimos registrados nessa conversa; não são uma consulta ao vivo da conta. `/status` na CLI
   mostra os dados dela. Pedidos de aprovação do Codex não têm detecção separada de status no Chube.
-- `restore::OpenChat` grava `agent`; arquivos antigos sem o campo continuam sendo Claude. Identificadores desconhecidos
+- `restore::OpenChat` grava `agent`, `auto` (modo do Omarchy), `host` e `tmux` (VPS); arquivos antigos sem os campos continuam
+  sendo chats locais do Claude, sem o modo. Identificadores desconhecidos
   de agente são ignorados. Chats novos sem histórico são gravados como rascunhos (`draft:<id>`) e voltam como chats
   novos do mesmo agente. Sub-chats sem id descoberto ainda ficam fora da restauração, como no Claude.
 - Opção `--agent claude|codex` (padrão `claude`): agente inicial do diálogo e destino de `--model`. Ao escolher o outro
@@ -196,10 +213,11 @@ mudanças, marcadas no topo de cada arquivo:
 - foco: o clique dá foco também no modo de mouse (a TUI do `claude` liga esse modo), clicar fora tira o foco
   (antes, o terminal do chat e o do painel ficavam os dois com foco e recebiam o mesmo texto) e o foco volta
   quando a janela recupera o dela (antes era preciso trocar de chat);
-- `terminal_theme.rs` só com as paletas COSMIC Dark/Light;
+- `terminal_theme.rs` com as paletas COSMIC Dark/Light (sem uso) e `from_palette`, que monta a paleta do tema do Omarchy
+  com o mesmo mapeamento do `alacritty.toml` gerado (preto = fundo, branco = texto, preto claro = `muted`);
 - o fundo das mensagens do usuário na TUI do `claude` (`rgb(55,55,55)` no tema escuro dela, `rgb(240,240,240)` no claro;
-  só elas usam esses cinzas, conferido na 2.1.303) vira uma faixa branca a 50% com texto preto em todos os temas
-  (`USER_MESSAGE_BG`/`USER_MESSAGE_FG`). Sem isso, a mensagem quase não se distinguia.
+  só elas usam esses cinzas, conferido na 2.1.303) vira a cor de seleção do tema do Omarchy com o texto claro dele
+  (`USER_MESSAGE_BG`/`USER_MESSAGE_FG`, atômicos definidos em `term::set_background`).
 - caracteres duplicados (2026-11-12): no GNOME/Wayland os caracteres que o IBus monta (ç, ã, á, à, â...) chegam
   como tecla pressionada **e** como `input_method::Event::Commit`, e saíam em dobro ("çç"). O `echo_guard.rs`
   (com testes) descarta o segundo quando o outro caminho trouxe o mesmo texto há até 50 ms. Só o caminho sem
@@ -210,93 +228,91 @@ mudanças, marcadas no topo de cada arquivo:
 `TermEvent`), tratados em `App::handle_term_event` como no `Message::TermEvent` do cosmic-term.
 Para trazer novidades do upstream, compare com o cosmic-term e reaplique só essas mudanças.
 
+## Agente do Omarchy (2026-11-13)
+
+- No painel de nova sessão, **omarchy (claude)** abre o agente padrão do Omarchy (`omarchy-default-agent`, lido ao abrir o app)
+  como o `omarchy agent` faz: `claude --permission-mode auto` ou `codex --approve-for-me` (`Chat::auto`), na pasta `~/Work`
+  quando o campo fica vazio. Se o agente padrão não for o Claude Code nem o Codex, a opção avisa e não cria.
+  Sem chat em foco, é a opção escolhida de início.
+- A conta (`omarchy agent account`) não precisa de nada do Chube: o `claude` e o `codex` do PATH são os wrappers do mise,
+  que passam pelo `omarchy-agent-account-exec` e já apontam `CLAUDE_CONFIG_DIR`/`CODEX_HOME` para a conta ativa.
+  Limitação: com uma conta que não seja a principal, o status e as sessões salvas continuam lidos de `~/.claude`.
+- Na lista e no cabeçalho, o agente aparece como `omarchy · claude`. O modo é gravado na lista de chats e vale ao retomar,
+  reabrir e no sub-chat. `chube --agent omarchy` faz o mesmo pela linha de comando.
+
+## Sessões na VPS (2026-11-13, `src/remote.rs`)
+
+- No painel de nova sessão, **onde** lista `local` e os hosts do `~/.ssh/config` (sem `*`/`?`). Na VPS, a pasta vai como
+  digitada (vazio = `~`, a home de lá); `Chat::cwd` guarda a pasta de lá e o PTY local roda na home daqui.
+- O chat roda `ssh -t <host> -- 'cd <pasta> || cd; exec tmux new-session -A -s chube-<8 hex> -e COLORTERM=truecolor bash -lc "<agente>" \; set-option …'`.
+  O `-A` entra no tmux se ele ainda existe; senão cria rodando o agente (`export PATH="$HOME/.local/bin:$PATH"; env -u ANTHROPIC_API_KEY claude …`).
+  Retomar uma sessão nova cujo histórico não foi gravado cai em `|| claude --session-id <mesmo id>`.
+- Opções só nas sessões do Chube (`set-option -t`): sem barra de status, `mouse on` (a roda rola o histórico do tmux),
+  `set-titles on` com `#{pane_title}` (o título do agente chega ao terminal daqui). A única opção global do servidor tmux é
+  `terminal-features ',xterm-256color:RGB'` (acrescenta truecolor).
+- **Fechar o chat só desconecta** (SIGHUP no `ssh`, o tmux continua). O botão `` (parar) do cabeçalho mata o tmux
+  (`tmux kill-session`). Rede caída fecha o `ssh` (`ServerAliveInterval=15`, 4 tentativas): o chat fica "conexão encerrada"
+  e "reconectar" volta ao mesmo tmux. O nome do tmux é gravado na lista de chats e reaproveitado ao reabrir o Chube.
+- Status: sem `~/.claude/sessions` lá, vem do título (`claude::status_from_title`): `✳` pronto, spinner trabalhando.
+  "precisa de você" não é detectado; contexto e modelo não aparecem ("na VPS"). O seletor de modo fica escondido.
+- SSH: todas as conexões usam `ControlMaster=auto`, `ControlPath=$XDG_RUNTIME_DIR/chube-ssh-%C` e `ControlPersist=15m`.
+  A chave do `vps-r1` tem senha e a sessão não tem agente SSH: o primeiro chat pede a senha **no terminal dele**, e as
+  consultas em segundo plano (`BatchMode=yes`) reaproveitam esse mestre. Sem mestre, o painel de sessões mostra "sem acesso…".
+  Com o agente SSH do Omarchy (`omarchy-setup-security-ssh-agent`, gcr-ssh-agent com a senha no chaveiro) isso some.
+- Painel de sessões, aba do host: os tmux abertos lá (`tmux list-sessions`, clicar entra neles: `Chat::attach`, gravado como
+  `tmux:<nome>`) e as últimas 150 sessões salvas do Claude Code de lá, lidas com `grep -o` (pasta e títulos, sem trazer o histórico).
+- Testado: o script remoto num tmux local isolado (`TMUX_TMPDIR`): opções aplicadas, argumentos com espaço preservados,
+  o tmux sobrevive ao SIGHUP e os títulos `✳`/spinner chegam ao terminal de fora. **Não testado contra a VPS de verdade**
+  (precisa da senha da chave): `claude` no PATH de lá, primeira conexão, lista remota, `kill`, reconectar.
+
 ## Convenções
 
 - Comentários em PT-BR, curtos, explicando o porquê.
 - Widgets com `widget::Column::new()` / `widget::Row::new()` (os helpers `widget::column()`/`row()` do iced exigem argumento),
   espaçamentos de `theme::spacing()`, seções dentro de `card()`.
 
-## Visual (estilo "terminal")
+## Visual (tema do Omarchy, desde 2026-11-13)
 
-- Sem a barra de título do libcosmic (`core.window.show_headerbar = false`, `content_container = false`): o conteúdo
-  ocupa a janela toda. O cabeçalho de cada seção (`section_header`) arrasta a janela e maximiza com clique duplo;
-  minimizar/maximizar/fechar (`window_controls`) ficam no fim do cabeçalho da seção mais à direita (terminal, ou chat).
-  O `mouse_area` do iced captura o clique esquerdo mesmo sem `on_press`: um `mouse_area` dentro do cabeçalho (o da roda do
-  mouse nas abas do terminal) precisa repetir o `on_drag`/`on_double_click`, senão a área dele não arrasta a janela.
-- Seções (`card()`): cantos retos, borda de 1 px em cinza claro (`border_color`), espaço de `space_xxs` entre elas e
-  dentro delas. O fundo (`background_color`) é pintado **uma vez só**, no container da janela: os cards não têm fundo e os
-  terminais usam `.opacity(0.0)` no fundo padrão. Assim, com o tema "frosted" (blur) do COSMIC, as seções ficam translúcidas
-  como os espaços entre elas; pintar de novo dobraria o alfa e deixaria as seções opacas.
-- Todo texto em fonte mono (`mono`, `bold`, `tinted`, tamanho `TEXT_SIZE`); cores do tema em `Colors`.
-  Os cabeçalhos das seções têm a mesma altura (`HEADER_HEIGHT`, duas linhas, como o do chat), para as linhas de baixo
-  ficarem alinhadas; é altura fixa no container (um `Space` de altura mínima dentro de uma `Row` não funcionou).
-  Títulos como `# chats`; botões de texto sem fundo (`ascii_button`/`flat_button`): `[+]`, `[fork]`, `[term]`, `[exit]`, `[«]`.
-- Status com símbolos da TUI (`status_glyph`): `✻` trabalhando, `?` precisa de você, `●` pronto, `○` iniciando, `×` encerrado.
-- Barras de uso/contexto em ASCII no estilo do htop (`ascii_bar`: `[||||||      42%]`, verde/amarelo ≥ 70%/vermelho ≥ 90%).
-  A quantidade de `|` vem da largura disponível (`widget::responsive`) dividida pela largura estimada do caractere
-  (`TEXT_SIZE * MONO_ADVANCE`, 0,6 na Fira Mono/Noto Sans Mono). Evite `█`/`░`: a Fira Mono (mono padrão do COSMIC)
-  não tem esses caracteres e a fonte de reserva tem outra largura.
-- Seletor de modo: botão `[⏸ manual ▾]` com menu em `widget::popover` (`App::mode_menu`), no lugar do `dropdown`
-  (que não aceita estilo). Abas do terminal desenhadas à mão (`chube ×`), sobre o mesmo `segmented_button::Model`,
-  num `scrollable` horizontal (a roda do mouse vertical vira rolagem horizontal pelo `mouse_area`; aba nova rola até o fim).
-  O nome é a última pasta do shell (`TabDir`, relida em `/proc/<pid>/cwd` a cada mudança de título, que o oh-my-zsh faz
-  a cada prompt); a segunda aba na mesma pasta vira `chube 2`, a terceira `chube 3` (`App::terminal_tab_names`).
-- Continuam no estilo padrão do COSMIC: o diálogo "Nova sessão" e a gaveta de sessões salvas (só os itens dela são mono).
-- Menus suspensos (modo, tema) usam `menu_card`: como `card`, mas com fundo opaco (o `popover` não pinta fundo).
+- **Cores** do tema atual do Omarchy (`~/.local/state/omarchy/current/theme/colors.toml`, `omarchy.rs`): fundo, texto,
+  `muted` (apagado), acento, seleção e as ANSI (verde = "pronto", amarelo = aviso, vermelho = erro). No Starship do usuário o
+  acento é `#7aa2f7` (overlay em `~/.config/omarchy/themes/starship/`) e o "verde" é laranja.
+- **Tema ao vivo**: a cada 2 s (`Message::CheckTheme`, em `spawn_blocking`) compara `theme.generation` e as datas do
+  `colors.toml`/`alacritty.toml`; mudou, `themes::reload` + `term::apply_theme` nos terminais + `set_theme` no libcosmic.
+- **Modo vidro**: a opacidade do bloco `# omarchy-glass` do `alacritty.toml` do tema (0,65) vai no fundo da janela, pintado
+  uma vez só no container da janela; cards sem fundo e terminais com `.opacity(0.0)`. O Hyprland desfoca o que fica atrás.
+- **Fonte**: a família `monospace` do fontconfig (`fc-match`, hoje JetBrainsMono Nerd Font; muda com `omarchy font set`) é
+  posta como monospace do cosmic-text em `themes::reload` (sem isso sairia a Noto/DejaVu). Tamanho da interface e dos
+  terminais = o do foot (`font=…:size=9` → 12 px).
+- **Tokens do shell do Omarchy** (`shell.toml`): seções com borda de 1 px no `muted` a 35%, cantos retos; linha selecionada
+  com fundo do texto a 8%, borda do texto a 25% e texto no acento; botões de texto com borda do texto a 40%; menus suspensos
+  (modo) com fundo opaco e borda de 2 px no acento, como os popups do shell; dicas com borda do texto.
+- **Ícones Nerd Font** (constantes `ICON_*` em `app.rs`) no lugar dos botões `[+]`: novo, histórico, ajuda, esconder,
+  fork, terminal, fechar, atualizar, servidor, parar. Status: `` trabalhando (acento), `` precisa de você, `` pronto,
+  `` iniciando, `` encerrado, `` em espera. Barras de uso em traços `━` (cor do nível sobre a cor de seleção).
+- Sem barra de título nem botões de janela: o Hyprland move e fecha (Super+W). Os cabeçalhos não arrastam mais a janela.
+- **Painéis no lugar do chat** (`Panel`): "nova sessão" (agente, onde, pasta; rótulos em cima e opções em `flex_row`, que
+  quebram linha numa seção estreita) e "sessões" (abas `local` / hosts). Substituem o diálogo e a gaveta do libcosmic.
+- A faixa das mensagens do usuário na TUI do `claude` (`rgb(55,55,55)`) vira a cor de seleção do tema, com o texto claro.
+- O `CosmicTheme` montado da paleta (cantos zero) vale para os widgets do libcosmic que sobraram (campo de texto, dicas,
+  rolagens, popover).
 - Funções async na UI via `cosmic::task::future(async { Message::… })`; trabalho de disco em `tokio::task::spawn_blocking`.
 - `Message` precisa ser `Clone + Debug`: o `Terminal` fica no `Chat` (dentro de `Mutex`), nunca numa mensagem.
-
-### Temas (`src/themes.rs`)
-- `[◐]` no cabeçalho "# uso" abre o menu: **sistema** (cores do COSMIC, como antes), **fósforo** (fundo `#000000` até no
-  container da janela, bordas cinza `#5A5A5A`, texto verde `#33FF66`), **neon** (gradiente azul translúcido na diagonal,
-  bordas ciano com brilho via `Shadow` do container, desfoque do COSMIC) e **gruvbox** (paleta Gruvbox dark, quente e opaca).
-  Mais quatro iguais aos temas de mesmo nome da dock, do painel e dos menus do GNOME (`temas.json` das extensões
-  `temas-*@pedro`): **vidro** (branco translúcido em gradiente), **fumê** (cinza escuro translúcido), **transparente**
-  (sem fundo, só o desfoque mais escuro) e **grafite** (cinza opaco). ANSI do GNOME Terminal.
-  E **preto**: fundo `#000000` opaco (sem desfoque), texto cinza-claro neutro, ANSI do GNOME Terminal com o preto puro.
-- O escolhido fica em `$XDG_CONFIG_HOME/chube/theme` (padrão `~/.config/chube/theme`, uma palavra: `system`, `phosphor`,
-  `neon`, `gruvbox`, `glass`, `smoke`, `transparent`, `graphite`, `black`) e é aplicado no `init`, antes de abrir terminais. O tema atual fica num `static` (`Theme::current`),
-  lido pelas funções de estilo (`Colors::get`, `window_background`, `border_color`, `card`, `flat_button`).
-- Cada tema próprio vira um `CosmicTheme` (`ThemeBuilder` com fundo, `text_tint`, cores e `frosted_windows`) aplicado com
-  `cosmic::command::set_theme`: diálogo, dicas e gaveta seguem o tema. O `CosmicTheme` calcula o próprio tom do texto, então a cor
-  exata da paleta vem do `Application::style` (cor padrão do texto) e dos estilos do app. Voltar a "sistema" usa
-  `cosmic::theme::system_preference()`, que segue as Configurações.
-- Terminais: `term::themes()` inclui a paleta ANSI de cada tema (`terminal_theme::from_palette`) e `Config::syntax_theme`
-  escolhe pelo tema atual; na troca, `term::apply_theme` recolore os terminais abertos (chats e abas).
-  Cores truecolor da TUI do `claude` não mudam, menos o fundo das mensagens do usuário (veja Terminal).
-- **Desfoque do fundo**: item `[x] desfoque` no mesmo menu (`Message::ToggleBlur`), gravado em `$XDG_CONFIG_HOME/chube/blur`
-  (`on`/`off`; sem o arquivo, ligado) e lido por `themes::blur()`. Desligado, `App::apply_blur` zera o `auto_blur` do `Core`
-  (o libcosmic deixa de pedir o blur ao compositor e de usar as cores translúcidas do tema, mesmo com o "frosted" ligado) e
-  `window_background` pinta as cores da paleta opacas (`Palette::solid`: a cor sobre o fundo do terminal do tema; só tirar o
-  alfa deixaria o vidro branco). A troca reaplica o tema com `set_theme`, que é quando o libcosmic refaz o pedido.
-- **Desfoque no GNOME** (o Mutter não atende o pedido do libcosmic): extensão própria em `gnome/desfoque-chube@pedro/`,
-  instalada e ligada pelo `install.sh` (vale depois de relogar; também está no `aplicar.sh` do GNOME). Usa a mesma camada
-  de vidro fosco da dock, do painel e dos menus (`desfoque.js`, cópia do da `temas-janelas@pedro`, que copia só as janelas
-  de baixo): um filho do `MetaWindowActor` do Chube, por baixo do conteúdo, recortado com os cantos da janela.
-  O filho é uma `BaseCamada`, que não se desenha dentro da cópia que outra camada faz da janela (desenhá-lo lá,
-  com as janelas em monitores diferentes, estragava o vidro da janela de baixo; veja o `desfoque.js`).
-  Quem decide é o Chube: `App::apply_blur` grava `~/.config/chube/desfoque` (`themes::save_blur_request`) com
-  `on <raio> <brilho %> <cantos>` (o `Palette::blur` do tema e o raio dos cantos da janela) ou `off` (desfoque desligado ou
-  tema opaco), e a extensão acompanha o arquivo. No tema do sistema, pede quando o fundo do COSMIC é translúcido.
-- O fundo da janela tem os mesmos cantos que o libcosmic dá à janela (`window_corner_radius`: `radius_s` + 4, retos com
-  `sharp_corners`); antes ele saía quadrado para fora da borda redonda.
-- Testar a extensão sem relogar: um GNOME Shell `--headless --wayland-display=<nome>` com dconf, `XDG_DATA_HOME` e
-  `XDG_CONFIG_HOME` próprios (exportados antes do `dbus-run-session`), a extensão ligada por link na pasta de extensões
-  dele, uma extensão que liga o `unsafe_mode` (para o `Eval` e a captura pelo D-Bus) e o Chube aberto com
-  `WAYLAND_DISPLAY=<nome>` e o mesmo `XDG_CONFIG_HOME`.
-- Testar um tema sem mexer no escolhido: gravar o nome em `~/.config/chube/theme`, abrir com `XDG_STATE_HOME=<pasta>` e capturar a tela.
 
 ## Verificar a UI
 
 O Claude **não consegue clicar nem digitar na janela** (o app não aparece no AT-SPI). Para validar:
-- captura de tela: `cosmic-screenshot --interactive=false --modal=false --notify=false -s <pasta>`;
-- fluxos de chat: abrir com `--model haiku --prompt "…"` e capturar a tela; status e sessão do `claude` do chat em
-  `~/.claude/sessions/<pid>.json` (`pgrep -af "claude --session-id"`);
-- para fechar o app: `pkill -x chube` (**não** `pkill -f …chube`, que casa com o próprio shell do comando).
-  Se o Claude estiver rodando **dentro** de um Chube, abra uma segunda instância e feche só ela pelo pid;
-- lógica fora da UI (parsers, resolução de diretório): testes em Rust;
-- cliques e digitação (troca de chat, painel de sessões, diálogo de nova sessão, sub-chat, "Reabrir sessão",
-  terminais, campo de mensagem, seletor de modo, `[term]`, atalhos de teclado, arrastar a janela pelos cabeçalhos, botões – □ ×): pedir para conferir manualmente;
+- captura da janela, mesmo atrás de outras ou noutro workspace: `grim -T <stableId> saida.png`, com o `stableId` de
+  `hyprctl clients -j` (o fundo sai cinza: é a transparência sem nada atrás). Não use `grim -g`: pega o que estiver na tela;
+- painéis sem clicar: `CHUBE_DEBUG_PANEL=new` (ou `new:<host>`), `sessions` ou `sessions:<host>` abre o app já nele;
+- chat sem clicar: `chube --agent omarchy --open-directory <pasta>` (sem prompt, não gasta limite);
+- testar sem mexer na lista real: `XDG_STATE_HOME=<pasta>` com o link `<pasta>/omarchy` (veja "Chats restaurados");
+- para fechar só a instância de teste: o pid que tem o `XDG_STATE_HOME` de teste em `/proc/<pid>/environ`
+  (**não** `pkill -f …chube`, que casa com o próprio shell do comando). Se o Claude estiver rodando **dentro** de um Chube,
+  abra uma segunda instância e feche só ela pelo pid;
+- lógica fora da UI (parsers, comandos, resolução de diretório): testes em Rust;
+- script remoto do tmux: rodar o script gerado (`remote::command`) com `sh -c` num PTY, com `TMUX_TMPDIR` próprio;
+- cliques e digitação (troca de chat, painéis, criar chat, sub-chat, "reabrir sessão", terminais, seletor de modo, botão do
+  terminal do Omarchy, atalhos de teclado, chats da VPS): pedir para conferir manualmente;
 - bytes que a TUI entende: script Python com `pty.fork()` rodando o `claude` (comandos locais como `/help` não gastam tokens).
 
 ## Status do projeto
@@ -307,12 +323,16 @@ markdown e cartão de permissão foi trocado pelo `claude` interativo num termin
 Instalado pelo `./install.sh` (2026-09-27): aparece no launcher como "Chube" e pode ser fixado no dock.
 
 Validado por captura de tela: o `claude` do chat abre com `--prompt`, responde, e status, modelo e contexto aparecem.
+Na migração para o Omarchy (2026-11-13), validado por captura: tema Starship (acento azul, vidro desfocado, JetBrainsMono
+Nerd Font), painéis de nova sessão e de sessões (local e a mensagem de "sem acesso" da VPS) e um chat no modo do Omarchy
+(`auto mode on`, seletor em "automático"). Não testado com clique: os painéis, troca de tema ao vivo e qualquer chat da VPS.
 Ainda não testado com clique: troca entre chats, painel de sessões, diálogo de nova sessão, sub-chat, "Reabrir sessão",
 digitação nos terminais, fechar chat.
 
 Limitações conhecidas:
 - o status só vem de `~/.claude/sessions`, um arquivo interno do Claude Code (formato pode mudar);
 - o terminal não tem menu de contexto, zoom, busca nem divisão em painéis (o cosmic-term tem);
+- chats da VPS: sem "precisa de você", contexto e modelo; o título inicial é o do painel do tmux (o hostname) até o agente pôr o dele;
 - a leitura do `/usage` depende do texto do Claude Code.
 
 
@@ -331,5 +351,6 @@ Limitações conhecidas:
   `Name=c-hub (claude)` / `c-hub (codex)`, `MimeType=inode/directory;`, `NoDisplay=true` e `%f`.
   As duas opções aparecem em "Open with" para pastas, sem acrescentar ícones ao launcher.
   `update-desktop-database` atualiza as associações; o Nautilus continua como aplicativo padrão para pastas.
+  (Escrito no COSMIC/GNOME; no Omarchy o "Abrir com" do Nautilus não foi conferido.)
 - Depois de atualizar, fechar e reabrir o c-hub para a instância atual passar a receber pedidos D-Bus.
   Testes de `cli.rs`: validação, caminhos relativos, múltiplas pastas e ida/volta pelo transporte dos argumentos.

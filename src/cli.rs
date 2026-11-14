@@ -9,6 +9,8 @@ pub const OPEN_ACTION: &str = "open-directories";
 #[derive(Clone, Debug, Default)]
 pub struct Flags {
     pub agent: Agent,
+    /// `--agent omarchy`: o agente padrão do Omarchy, no modo do `omarchy agent`.
+    pub auto: bool,
     pub model: Option<String>,
     /// Caminhos absolutos, já validados no processo que recebeu a chamada do Files.
     pub directories: Vec<String>,
@@ -23,7 +25,7 @@ impl cosmic::app::CosmicFlags for Flags {
     }
 
     fn args(&self) -> Vec<&str> {
-        let mut args = vec!["--agent", self.agent.key()];
+        let mut args = vec!["--agent", if self.auto { "omarchy" } else { self.agent.key() }];
         if let Some(model) = &self.model {
             args.extend(["--model", model.as_str()]);
         }
@@ -43,7 +45,14 @@ pub fn parse(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Flag
         match arg.as_str() {
             "--agent" => {
                 let value = args.next().ok_or("Falta o agente depois de --agent")??;
-                flags.agent = Agent::parse(&value).ok_or_else(|| format!("Agente inválido: {value}"))?;
+                if value == "omarchy" {
+                    flags.auto = true;
+                    flags.agent = crate::omarchy::default_agent()
+                        .and_then(|name| Agent::parse(&name))
+                        .ok_or("O agente padrão do Omarchy não é o Claude Code nem o Codex")?;
+                } else {
+                    flags.agent = Agent::parse(&value).ok_or_else(|| format!("Agente inválido: {value}"))?;
+                }
             }
             "--model" => flags.model = Some(args.next().ok_or("Falta o modelo depois de --model")??),
             "--open-directory" => {

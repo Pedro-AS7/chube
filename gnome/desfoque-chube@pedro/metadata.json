@@ -1,7 +1,0 @@
-{
-  "uuid": "desfoque-chube@pedro",
-  "name": "Desfoque do Chube",
-  "description": "Vidro fosco atrás das janelas do Chube, o mesmo da dock, do painel e dos menus. Ligado e ajustado pelo próprio Chube (menu [◐]).",
-  "shell-version": ["46"],
-  "version": 1
-}

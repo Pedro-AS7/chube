@@ -20,6 +20,8 @@ pub struct SavedSession {
     pub modified: SystemTime,
     /// Status (`busy`, `idle`…) se a sessão está aberta em outro processo do Claude Code.
     pub running: Option<String>,
+    /// Host do SSH, numa sessão da VPS; `None` nas desta máquina.
+    pub host: Option<String>,
 }
 
 /// Lista as sessões salvas, da mais recente para a mais antiga.
@@ -97,6 +99,7 @@ fn summarize(path: &Path, modified: SystemTime) -> Option<SavedSession> {
         title: title.lines().next().unwrap_or_default().to_owned(),
         modified,
         running: None,
+        host: None,
     })
 }
 

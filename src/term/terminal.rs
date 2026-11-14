@@ -1,7 +1,7 @@
 // Adaptado de cosmic-term (src/terminal.rs), © System76, GPL-3.0-only.
 // Mudanças: eventos identificados por TabId em vez de (pane, aba); sem TerminalPaneGrid;
 // `pid()` expõe o pid do processo do PTY; as mensagens do usuário na TUI do `claude` viram
-// uma faixa branca com texto preto (`USER_MESSAGE_BG`).
+// uma faixa na cor de seleção do tema do Omarchy (`USER_MESSAGE_BG`).
 
 use alacritty_terminal::{
     Term,
@@ -122,10 +122,10 @@ fn as_dim(mut color: Color) -> Color {
 pub static WINDOW_BG_COLOR: AtomicU32 = AtomicU32::new(0xFF000000);
 
 /// Faixa das mensagens do usuário na TUI do `claude`. Ela as pinta de cinza (`rgb(55,55,55)` no
-/// tema escuro, `rgb(240,240,240)` no claro), que quase some sobre o fundo dos temas do Chube.
-/// Branco a 50%: o fundo da janela aparece através da faixa.
-const USER_MESSAGE_BG: cosmic_text::Color = cosmic_text::Color::rgba(0xFF, 0xFF, 0xFF, 0x80);
-const USER_MESSAGE_FG: cosmic_text::Color = cosmic_text::Color::rgb(0x00, 0x00, 0x00);
+/// tema escuro, `rgb(240,240,240)` no claro), fixo, que destoa nos temas claros e coloridos do
+/// Omarchy: vira a cor de seleção do tema, com o texto claro dele (`term::set_background`).
+pub static USER_MESSAGE_BG: AtomicU32 = AtomicU32::new(0xFF3A3A3C);
+pub static USER_MESSAGE_FG: AtomicU32 = AtomicU32::new(0xFFFFFFFF);
 
 fn is_user_message_bg(color: Color) -> bool {
     matches!(
@@ -835,8 +835,8 @@ impl Terminal {
                     if !indexed.cell.flags.contains(Flags::INVERSE)
                         && is_user_message_bg(indexed.cell.bg)
                     {
-                        bg = USER_MESSAGE_BG;
-                        fg = USER_MESSAGE_FG;
+                        bg = cosmic_text::Color(USER_MESSAGE_BG.load(Ordering::Relaxed));
+                        fg = cosmic_text::Color(USER_MESSAGE_FG.load(Ordering::Relaxed));
                     }
 
                     if indexed.cell.flags.contains(Flags::HIDDEN) {

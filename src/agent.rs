@@ -9,7 +9,6 @@ pub enum Agent {
 }
 
 impl Agent {
-    pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
     pub const LABELS: [&'static str; 2] = ["Claude Code", "Codex"];
 
     pub fn key(self) -> &'static str {
@@ -28,10 +27,19 @@ impl Agent {
         match value { "claude" => Some(Self::Claude), "codex" => Some(Self::Codex), _ => None }
     }
 
-    pub fn command(self, start: &Start, model: Option<&str>, prompt: Option<&str>) -> (String, Vec<String>) {
+    /// Comando para rodar o agente nesta máquina.
+    pub fn command(self, start: &Start, model: Option<&str>, prompt: Option<&str>, auto: bool) -> (String, Vec<String>) {
         match self {
-            Self::Claude => claude::command(start, model, prompt),
-            Self::Codex => crate::codex::command(start, model, prompt),
+            Self::Claude => claude::command(start, model, prompt, auto),
+            Self::Codex => crate::codex::command(start, model, prompt, auto),
+        }
+    }
+
+    /// Só os argumentos, para rodar o agente na VPS.
+    pub fn args(self, start: &Start, model: Option<&str>, prompt: Option<&str>, auto: bool) -> Vec<String> {
+        match self {
+            Self::Claude => claude::args(start, model, prompt, auto),
+            Self::Codex => crate::codex::args(start, model, prompt, auto),
         }
     }
 

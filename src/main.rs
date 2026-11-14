@@ -6,6 +6,8 @@ mod chat;
 mod claude;
 mod commands;
 mod dirs;
+mod omarchy;
+mod remote;
 mod restore;
 mod sessions;
 mod shortcuts;
@@ -44,7 +46,7 @@ fn main() -> cosmic::iced::Result {
         .size_limits(Limits::NONE.min_width(900.0).min_height(560.0));
 
     if std::env::args_os().nth(1).is_some_and(|arg| arg == "--help" || arg == "-h") {
-        println!("Uso: chube [--agent claude|codex] [--model <modelo>] [--open-directory <pasta>] [-- <pastas>…]");
+        println!("Uso: chube [--agent omarchy|claude|codex] [--model <modelo>] [--open-directory <pasta>] [-- <pastas>…]");
         return Ok(());
     }
     let flags = cli::parse(std::env::args_os().skip(1)).unwrap_or_else(|error| {

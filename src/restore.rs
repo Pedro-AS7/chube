@@ -19,6 +19,11 @@ pub struct OpenChat {
     pub model: Option<String>,
     /// Título do chat de origem, num sub-chat.
     pub parent: Option<String>,
+    /// Modo do `omarchy agent`.
+    pub auto: bool,
+    /// Host do SSH e sessão do tmux, num chat da VPS.
+    pub host: Option<String>,
+    pub tmux: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -66,6 +71,9 @@ fn to_json(open: &OpenChats) -> String {
                 "title": chat.title,
                 "model": chat.model,
                 "parent": chat.parent,
+                "auto": chat.auto,
+                "host": chat.host,
+                "tmux": chat.tmux,
             })
         })
         .collect();
@@ -92,6 +100,9 @@ fn parse(text: &str) -> Option<OpenChats> {
                 title: field("title").unwrap_or_else(|| "Chat".into()),
                 model: field("model"),
                 parent: field("parent"),
+                auto: chat.get("auto").and_then(Value::as_bool).unwrap_or(false),
+                host: field("host"),
+                tmux: field("tmux"),
             })
         })
         .collect();
@@ -111,6 +122,9 @@ mod tests {
             title: format!("Chat {id}"),
             model: Some("haiku".into()),
             parent: parent.map(str::to_owned),
+            auto: false,
+            host: None,
+            tmux: None,
         }
     }
 
@@ -143,6 +157,9 @@ mod tests {
         assert_eq!(old.chats[0].agent, crate::agent::Agent::Claude);
         let mut codex = chat("b", None);
         codex.agent = crate::agent::Agent::Codex;
+        codex.auto = true;
+        codex.host = Some("vps-r1".into());
+        codex.tmux = Some("chube-1".into());
         let mixed = OpenChats { chats: vec![old.chats[0].clone(), codex], focused: 1 };
         assert_eq!(parse(&to_json(&mixed)), Some(mixed));
         let unknown = parse(r#"{"chats":[{"agent":"outro","session_id":"a","cwd":"/tmp"}]}"#).unwrap();

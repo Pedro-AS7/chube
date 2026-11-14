@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=C-hub
-GenericName=Sessões do Claude Code e Codex
-Comment=Chats do Claude Code e Codex, sessões salvas, uso do plano e terminal integrado
+GenericName=Sessões do Claude Code e do Codex, aqui e na VPS
+Comment=Chats do agente do Omarchy, do Claude Code e do Codex, aqui e na VPS, com uso do plano e terminal integrado
 Exec=@BIN@
 Icon=com.pedro.Chube
 Terminal=false
 Categories=Development;
-Keywords=claude;codex;terminal;sessões;ia;
+Keywords=claude;codex;omarchy;agente;vps;ssh;tmux;terminal;sessões;ia;
 StartupWMClass=com.pedro.Chube

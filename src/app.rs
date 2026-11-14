@@ -5,31 +5,35 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use cosmic::app::{Core, Task};
-use cosmic::core::Auto;
 use cosmic::iced::keyboard::{Key, key::Named};
 use cosmic::iced::font::Weight;
 use cosmic::iced::widget::scrollable;
 use cosmic::iced::widget::text::Wrapping;
-use cosmic::iced::{Alignment, Background, Border, Color, Font, Length, Radians, Shadow, Subscription};
+use cosmic::iced::{Alignment, Border, Color, Font, Length, Subscription};
 use cosmic::widget::{self, pane_grid, segmented_button, text_editor, tooltip};
 use cosmic::{Application, ApplicationExt, Element, theme};
 
 use crate::agent::Agent;
 use crate::codex;
 use crate::cli::{self, Flags};
-use crate::chat::{Chat, ModeChange, Status};
+use crate::chat::{Chat, ModeChange, Status, TMUX_ID_PREFIX};
 use crate::claude::{self, Mode, Start};
 use crate::commands::{self, Command};
 use crate::dirs;
+use crate::omarchy;
+use crate::remote::{self, Listing};
 use crate::restore::{self, OpenChat, OpenChats};
 use crate::sessions::{self, Running, SavedSession, Stats};
 use crate::shortcuts::{self, Shortcut};
 use crate::term::{self, Terminal};
-use crate::themes::{self, Theme};
+use crate::themes;
 use crate::usage::{self, Limit, Window};
 
-/// Intervalo de atualização automática do painel de uso.
-const REFRESH_EVERY: Duration = Duration::from_secs(180);
+/// Intervalo de atualização automática do painel de uso. Os limites vêm do arquivo que o
+/// Omarchy atualiza; só sem ele o Chube roda o `/usage`.
+const REFRESH_EVERY: Duration = Duration::from_secs(120);
+/// Intervalo da conferência do tema do Omarchy (o Chube muda junto com `omarchy theme set`).
+const THEME_CHECK_EVERY: Duration = Duration::from_secs(2);
 /// Intervalo da leitura do status das sessões (`~/.claude/sessions`).
 const POLL_EVERY: Duration = Duration::from_secs(1);
 const TITLE_MAX_CHARS: usize = 40;
@@ -38,20 +42,51 @@ const TITLE_MAX_CHARS: usize = 40;
 const SUBMIT_DELAY: Duration = Duration::from_millis(80);
 /// Espera entre um Shift+Tab e a leitura do modo na tela.
 const MODE_STEP_DELAY: Duration = Duration::from_millis(250);
-/// Tempo máximo esperando o `claude` de um chat sair antes de abrir a sessão no COSMIC Terminal.
+/// Tempo máximo esperando o `claude` de um chat sair antes de abrir a sessão no terminal do Omarchy.
 const EXIT_WAIT: Duration = Duration::from_secs(5);
 /// Mais Shift+Tab do que isso e o modo pedido não está no ciclo.
 const MODE_MAX_STEPS: u8 = 6;
 /// Altura máxima do campo de mensagem; acima disso, ele rola.
 const COMPOSER_MAX_HEIGHT: f32 = 360.0;
-/// Tamanho do texto da interface, toda em fonte mono, como no terminal.
-const TEXT_SIZE: f32 = 13.0;
-/// Largura de um caractere da fonte mono, em relação ao tamanho (0,6 na Noto Sans Mono e na
+/// Largura de um caractere da fonte mono, em relação ao tamanho (0,6 na JetBrains Mono e na
 /// maioria das mono); usada para saber quantos caracteres cabem numa barra.
 const MONO_ADVANCE: f32 = 0.6;
 const TAB_TITLE_MAX_CHARS: usize = 24;
+
+/// Tamanho do texto da interface: o mesmo da fonte do terminal do Omarchy.
+fn text_size() -> f32 {
+    themes::current().font_px
+}
+
 /// Altura do cabeçalho das seções: duas linhas, como o do chat (título e pasta/modo).
-const HEADER_HEIGHT: f32 = 2.0 * TEXT_SIZE * 1.4;
+fn header_height() -> f32 {
+    2.0 * text_size() * 1.4
+}
+
+/// O que abrir num chat novo: o agente padrão do Omarchy no modo do `omarchy agent`, ou um
+/// agente escolhido, no modo dele.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Launch {
+    Omarchy,
+    Claude,
+    Codex,
+}
+
+/// Painel mostrado no lugar do terminal do chat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Panel {
+    None,
+    NewChat,
+    Sessions,
+}
+
+/// Sessões de uma VPS, buscadas por SSH.
+#[derive(Clone, Debug)]
+enum RemoteState {
+    Loading,
+    Loaded(Listing),
+    Failed(String),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
@@ -66,31 +101,40 @@ pub enum Message {
     OpenDirectories(Result<Flags, String>),
     NewChat,
     NewChatInput(String),
-    NewChatAgent(usize),
+    NewChatLaunch(Launch),
+    /// Onde rodar: esta máquina (`None`) ou um host do SSH.
+    NewChatHost(Option<String>),
     NewChatConfirm,
-    NewChatCancel,
     NewChatBrowse,
     NewChatPicked(Option<PathBuf>),
     ToggleDirGroup(PathBuf),
     ShowSessions,
-    CloseSessions,
+    ClosePanel,
+    /// Sessões de qual lugar mostrar: esta máquina (`None`) ou um host do SSH.
+    SessionsHost(Option<String>),
     SessionsLoaded(Vec<SavedSession>),
+    RemoteListed(String, Result<Listing, String>),
     ResumeSession(usize),
+    /// Retoma uma sessão salva da VPS (host, índice na lista dela).
+    ResumeRemote(String, usize),
+    /// Entra numa sessão do tmux aberta na VPS (host, índice na lista dela).
+    AttachTmux(String, usize),
+    /// Encerra o agente do chat em foco na VPS (mata o tmux dele).
+    KillRemote,
+    RemoteKilled(Result<(), String>),
     SubChat,
     ReopenChat,
     CloseChat(usize),
-    /// Leva a sessão do chat em foco para o COSMIC Terminal.
+    /// Leva a sessão do chat em foco para o terminal do Omarchy.
     OpenInTerminal,
     /// Se a sessão do chat já tem `.jsonl` (sem ele, o `--resume` falha).
     OpenInTerminalChecked(term::TabId, bool),
     OpenedInTerminal(Result<(), String>),
     SetMode(usize),
     ModeMenu(bool),
-    /// Tema escolhido (índice em `Theme::ALL`).
-    SetTheme(usize),
-    ThemeMenu(bool),
-    /// Liga/desliga o desfoque do fundo.
-    ToggleBlur,
+    /// Confere se o tema do Omarchy mudou.
+    CheckTheme,
+    ThemeChecked(String),
     ModeStep(term::TabId),
     ComposerAction(text_editor::Action),
     ComposerSend,
@@ -103,7 +147,9 @@ pub enum Message {
     Polled(Vec<Polled>),
     OpenLink(String),
     RefreshInfo,
-    UsageFetched(Result<Vec<Limit>, String>),
+    /// Limites do Claude (do Omarchy ou do `/usage`), os do Codex (do Omarchy) e a hora da
+    /// leitura feita pelo Omarchy.
+    UsageFetched(Result<Vec<Limit>, String>, Option<Vec<Limit>>, Option<String>),
     ContextWindowFetched(String, Option<u32>),
     PaneResized(pane_grid::ResizeEvent),
     HideSection(Section),
@@ -118,10 +164,6 @@ pub enum Message {
     Shortcut(Shortcut),
     /// Dá o foco do teclado ao terminal da seção (mostrando-a, se escondida).
     FocusSection(Section),
-    DragWindow,
-    ToggleMaximize,
-    Minimize,
-    CloseWindow,
 }
 
 /// Pasta atual do shell de uma aba do terminal (dado da aba no `segmented_button::Model`).
@@ -145,7 +187,15 @@ pub struct App {
     default_dir: PathBuf,
     model: Option<String>,
     default_agent: Agent,
-    new_chat_agent: Agent,
+    /// Agente padrão do Omarchy (`omarchy default agent`), se for o Claude Code ou o Codex.
+    omarchy_agent: Option<Agent>,
+    /// `--agent omarchy` na linha de comando.
+    default_auto: bool,
+    new_chat_launch: Launch,
+    new_chat_host: Option<String>,
+    /// Hosts do `~/.ssh/config`, oferecidos como lugar dos chats.
+    hosts: Vec<String>,
+    panel: Panel,
     /// Id do campo de mensagem do chat (hoje fora da tela).
     composer_id: widget::Id,
     /// Ids dos terminais na tela (o do chat em foco e o da aba ativa), para dar o foco a eles.
@@ -161,8 +211,8 @@ pub struct App {
     /// Proporções das divisões, guardadas para refazer o layout ao esconder/mostrar seções.
     sidebar_ratio: f32,
     chat_ratio: f32,
-    /// Texto do diálogo de nova sessão; `None` com o diálogo fechado.
-    new_chat_input: Option<String>,
+    /// Pasta digitada no painel de nova sessão.
+    new_chat_input: String,
     new_chat_input_id: widget::Id,
     /// Abas do terminal; cada uma guarda seu `TabId` e o `Mutex<Terminal>`.
     terminal_tabs: segmented_button::SingleSelectModel,
@@ -178,15 +228,23 @@ pub struct App {
     /// Janela de contexto de cada modelo, pelo `/context`; `None` enquanto busca ou se falhou
     /// (não tenta de novo a cada `Poll`).
     context_windows: HashMap<String, Option<u32>>,
-    /// Sessões salvas mostradas no painel lateral; `None` enquanto carrega.
+    /// Sessões salvas desta máquina; `None` enquanto carrega.
     saved_sessions: Option<Vec<SavedSession>>,
+    /// Lugar mostrado no painel de sessões: esta máquina (`None`) ou um host do SSH.
+    sessions_host: Option<String>,
+    remote_sessions: HashMap<String, RemoteState>,
+    /// Limites do Codex lidos do Omarchy (os do histórico da sessão, sem ele).
+    codex_usage: Option<Vec<Limit>>,
+    /// Conta ativa no `omarchy agent account`.
+    account: Option<String>,
+    /// Marca do tema do Omarchy aplicado, para saber quando ele muda.
+    theme_fingerprint: String,
+    checking_theme: bool,
     /// Diretórios abertos na lista de sessões salvas.
     expanded_dirs: HashSet<PathBuf>,
     /// Menu do seletor de modo aberto.
     mode_menu: bool,
-    /// Menu de temas aberto.
-    theme_menu: bool,
-    /// Aviso mostrado abaixo do cabeçalho do chat (ex.: falha ao abrir no COSMIC Terminal).
+    /// Aviso mostrado abaixo do cabeçalho do chat (ex.: falha ao abrir no terminal do Omarchy).
     notice: Option<String>,
     /// Última lista de chats gravada (`restore`), para só gravar quando mudar.
     open_chats: OpenChats,
@@ -214,6 +272,9 @@ impl Application for App {
             .filter(|dir| dir.parent().is_some())
             .unwrap_or_else(claude::home_dir);
 
+        // Cores e fonte do tema do Omarchy antes de abrir qualquer terminal.
+        let palette = themes::reload();
+        let omarchy_agent = omarchy::default_agent().and_then(|name| Agent::parse(&name));
         let mut app = App {
             core,
             chats: Vec::new(),
@@ -221,7 +282,12 @@ impl Application for App {
             default_dir,
             model: flags.model.clone(),
             default_agent: flags.agent,
-            new_chat_agent: flags.agent,
+            omarchy_agent,
+            default_auto: flags.auto,
+            new_chat_launch: Launch::Claude,
+            new_chat_host: None,
+            hosts: remote::hosts(),
+            panel: Panel::None,
             composer_id: widget::Id::unique(),
             chat_terminal_id: widget::Id::unique(),
             tab_terminal_id: widget::Id::unique(),
@@ -233,7 +299,7 @@ impl Application for App {
             terminal_visible: true,
             sidebar_ratio: 0.22,
             chat_ratio: 0.64,
-            new_chat_input: None,
+            new_chat_input: String::new(),
             new_chat_input_id: widget::Id::unique(),
             terminal_tabs: segmented_button::SingleSelectModel::default(),
             next_terminal_id: 0,
@@ -244,14 +310,19 @@ impl Application for App {
             fetching_usage: false,
             context_windows: HashMap::new(),
             saved_sessions: None,
+            sessions_host: None,
+            remote_sessions: HashMap::new(),
+            codex_usage: None,
+            account: omarchy::active_account("claude"),
+            theme_fingerprint: omarchy::theme_fingerprint(),
+            checking_theme: false,
             expanded_dirs: HashSet::new(),
             mode_menu: false,
-            theme_menu: false,
             notice: None,
             open_chats: OpenChats::default(),
         };
-        // Sem a barra de título: o conteúdo ocupa a janela toda. Os cabeçalhos das seções
-        // arrastam a janela, e os botões dela ficam no cabeçalho da seção da direita.
+        // Sem a barra de título, como as janelas do Omarchy: o Hyprland move, fecha e
+        // redimensiona (Super+W fecha).
         app.core.window.show_headerbar = false;
         app.core.window.content_container = false;
         app.rebuild_panes();
@@ -260,7 +331,13 @@ impl Application for App {
         let open = restore::load();
         for saved in &open.chats {
             let id = app.take_terminal_id();
-            let has_file = saved.agent.session_file(&saved.session_id).is_some();
+            // Na VPS não dá para conferir o histórico daqui: o comando de lá começa de novo se
+            // não houver o que retomar.
+            let has_file = if saved.host.is_some() {
+                !saved.session_id.starts_with("draft:")
+            } else {
+                saved.agent.session_file(&saved.session_id).is_some()
+            };
             app.chats.push(Chat::restore(id, saved, has_file));
         }
         app.focused = open.focused.min(app.chats.len().saturating_sub(1));
@@ -271,17 +348,10 @@ impl Application for App {
             None => Task::none(),
         };
         let usage = app.refresh_usage();
-        // O tema escolhido vale antes de abrir qualquer terminal (as cores vêm dele).
-        let theme = Theme::load();
-        theme.make_current();
-        themes::set_blur(themes::load_blur());
-        app.apply_blur();
-        let theme = match theme {
-            Theme::System => Task::none(),
-            theme => cosmic::command::set_theme(theme.cosmic()),
-        };
+        let theme = cosmic::command::set_theme(palette.cosmic());
         let open = app.open_directories(flags);
-        (app, Task::batch([title, usage, theme, open]))
+        let debug = app.debug_panel();
+        (app, Task::batch([title, usage, theme, open, debug]))
     }
 
     fn dbus_activation(&mut self, message: cosmic::dbus_activation::Message) -> Task<Message> {
@@ -323,73 +393,17 @@ impl Application for App {
                 _ => None,
             }),
         ];
+        subscriptions.push(cosmic::iced::time::every(THEME_CHECK_EVERY).map(|_| Message::CheckTheme));
         if self.chats.iter().any(Chat::is_alive) {
             subscriptions.push(cosmic::iced::time::every(POLL_EVERY).map(|_| Message::Poll));
         }
         Subscription::batch(subscriptions)
     }
 
-    fn context_drawer(&self) -> Option<cosmic::app::ContextDrawer<'_, Message>> {
-        if !self.core.window.show_context {
-            return None;
-        }
-        Some(
-            cosmic::app::context_drawer(self.sessions_list(), Message::CloseSessions)
-                .title("Sessões salvas"),
-        )
-    }
-
-    fn dialog(&self) -> Option<Element<'_, Message>> {
-        let input = self.new_chat_input.as_ref()?;
-        let space = theme::spacing();
-        let resolved = dirs::resolve(input, &self.focused_dir());
-
-        let preview = match &resolved {
-            Ok(path) => format!("→ {}", path.display()),
-            Err(error) => error.clone(),
-        };
-        let names: Vec<String> = dirs::shortcuts().into_iter().map(|(name, _)| name).collect();
-        let mut control = widget::Column::new()
-            .push(widget::dropdown(&Agent::LABELS, Some(self.new_chat_agent.index()), Message::NewChatAgent))
-            .push(
-                widget::text_input("Diretório, atalho do fshort ou .", input)
-                    .id(self.new_chat_input_id.clone())
-                    .on_input(Message::NewChatInput)
-                    .on_submit(|_| Message::NewChatConfirm),
-            )
-            .push(widget::text::caption(preview))
-            .spacing(space.space_xs);
-        if !names.is_empty() {
-            control = control.push(widget::text::caption(format!(
-                "Atalhos: {}",
-                names.join(", ")
-            )));
-        }
-
-        Some(
-            widget::dialog()
-                .title("Nova sessão")
-                .body(format!(
-                    "\".\" usa a pasta do chat em foco ({}).",
-                    claude::display_path(&self.focused_dir())
-                ))
-                .control(control)
-                .primary_action(
-                    widget::button::suggested("Criar")
-                        .on_press_maybe(resolved.is_ok().then_some(Message::NewChatConfirm)),
-                )
-                .secondary_action(widget::button::standard("Cancelar").on_press(Message::NewChatCancel))
-                .tertiary_action(
-                    widget::button::text("Escolher pasta…").on_press(Message::NewChatBrowse),
-                )
-                .into(),
-        )
-    }
-
-    /// Nos temas próprios, a cor padrão do texto é a da paleta. O fundo fica transparente
-    /// (é pintado no `view`), também com a janela maximizada.
+    /// A cor padrão do texto é a do tema do Omarchy. O fundo fica transparente (é pintado no
+    /// `view`, com a opacidade do modo vidro).
     fn style(&self) -> Option<cosmic::iced::theme::Style> {
-        let palette = Theme::current().palette()?;
+        let palette = themes::current();
         Some(cosmic::iced::theme::Style {
             background_color: Color::TRANSPARENT,
             text_color: palette.text,
@@ -399,7 +413,6 @@ impl Application for App {
 
     fn view(&self) -> Element<'_, Message> {
         let space = theme::spacing();
-        let sharp = self.core.window.sharp_corners;
 
         widget::container(
             pane_grid::PaneGrid::new(&self.panes, |_pane, section, _maximized| {
@@ -410,14 +423,10 @@ impl Application for App {
             .on_resize(10, Message::PaneResized),
         )
         .padding(space.space_xxs)
-        // Sem o `content_container` do libcosmic, o fundo da janela é daqui. Com os mesmos cantos
-        // que o libcosmic dá à janela: sem eles, o fundo sai quadrado para fora da borda redonda.
-        .class(theme::Container::custom(move |theme| widget::container::Style {
-            background: Some(window_background(theme)),
-            border: Border {
-                radius: if sharp { 0.0 } else { window_corner_radius(theme) }.into(),
-                ..Default::default()
-            },
+        // Sem o `content_container` do libcosmic, o fundo da janela é daqui: o do tema, com a
+        // opacidade do modo vidro (o Hyprland desfoca o que fica atrás), cantos retos.
+        .class(theme::Container::custom(|_| widget::container::Style {
+            background: Some(themes::current().window().into()),
             ..Default::default()
         }))
         .into()
@@ -437,24 +446,48 @@ impl App {
                 }
             }
             Message::NewChat => {
-                self.new_chat_agent = self.chats.get(self.focused).map_or(self.default_agent, |chat| chat.agent);
-                self.new_chat_input = Some(String::new());
+                // Herda o agente e o lugar do chat em foco; sem chat, o padrão da linha de comando.
+                let (launch, host) = match self.chats.get(self.focused) {
+                    Some(chat) if chat.auto => (Launch::Omarchy, chat.host.clone()),
+                    Some(chat) => (launch_of(chat.agent), chat.host.clone()),
+                    None if self.default_auto => (Launch::Omarchy, None),
+                    // Sem chat, o agente do Omarchy, se ele for um dos que o Chube abre.
+                    None if self.omarchy_agent.is_some() => (Launch::Omarchy, None),
+                    None => (launch_of(self.default_agent), None),
+                };
+                self.new_chat_launch = launch;
+                self.new_chat_host = host;
+                self.new_chat_input = String::new();
+                self.panel = Panel::NewChat;
                 return widget::text_input::focus(self.new_chat_input_id.clone());
             }
-            Message::NewChatInput(text) => self.new_chat_input = Some(text),
-            Message::NewChatAgent(index) => {
-                if let Some(agent) = Agent::ALL.get(index) { self.new_chat_agent = *agent; }
-            },
-            Message::NewChatCancel => self.new_chat_input = None,
+            Message::NewChatInput(text) => self.new_chat_input = text,
+            Message::NewChatLaunch(launch) => self.new_chat_launch = launch,
+            Message::NewChatHost(host) => {
+                self.new_chat_host = host;
+                return widget::text_input::focus(self.new_chat_input_id.clone());
+            }
+            Message::ClosePanel => {
+                self.panel = Panel::None;
+                return self.focus_chat();
+            }
             Message::NewChatConfirm => {
-                let Some(input) = &self.new_chat_input else {
+                let Some((agent, auto)) = self.launch_agent(self.new_chat_launch) else {
                     return Task::none();
                 };
-                if let Ok(folder) = dirs::resolve(input, &self.focused_dir()) {
-                    self.new_chat_input = None;
-                    let id = self.take_terminal_id();
-                    return self.open_chat(self.chats.len(), Chat::new(id, self.new_chat_agent, folder, self.new_model(self.new_chat_agent), None));
-                }
+                let folder = match &self.new_chat_host {
+                    // Na VPS, a pasta vai como foi digitada (o `~` é a home de lá).
+                    Some(_) => PathBuf::from(remote_dir(&self.new_chat_input)),
+                    None => match self.new_chat_dir() {
+                        Ok(folder) => folder,
+                        Err(_) => return Task::none(),
+                    },
+                };
+                self.panel = Panel::None;
+                let id = self.take_terminal_id();
+                let chat = Chat::new(id, agent, folder, self.new_model(agent), None)
+                    .with_place(auto, self.new_chat_host.clone());
+                return self.open_chat(self.chats.len(), chat);
             }
             Message::NewChatBrowse => {
                 return cosmic::task::future(async {
@@ -469,7 +502,7 @@ impl App {
             }
             // A pasta escolhida vai para o campo, para ser conferida antes de criar.
             Message::NewChatPicked(Some(folder)) => {
-                self.new_chat_input = Some(folder.display().to_string());
+                self.new_chat_input = folder.display().to_string();
             }
             Message::NewChatPicked(None) => {}
             Message::ToggleDirGroup(dir) => {
@@ -478,23 +511,23 @@ impl App {
                 }
             }
             Message::ShowSessions => {
-                self.saved_sessions = None;
+                self.panel = Panel::Sessions;
+                self.sessions_host = self.chats.get(self.focused).and_then(|chat| chat.host.clone());
                 self.expanded_dirs = HashSet::from([self.focused_dir()]);
-                self.set_show_context(true);
-                return cosmic::task::future(async {
-                    let list = tokio::task::spawn_blocking(|| {
-                        let mut list = sessions::list();
-                        list.extend(codex::list());
-                        list.sort_by(|a,b| b.modified.cmp(&a.modified));
-                        list
-                    })
-                        .await
-                        .unwrap_or_default();
-                    Message::SessionsLoaded(list)
-                });
+                return self.load_sessions();
             }
-            Message::CloseSessions => self.set_show_context(false),
+            Message::SessionsHost(host) => {
+                self.sessions_host = host;
+                return self.load_sessions();
+            }
             Message::SessionsLoaded(list) => self.saved_sessions = Some(list),
+            Message::RemoteListed(host, result) => {
+                let state = match result {
+                    Ok(listing) => RemoteState::Loaded(listing),
+                    Err(error) => RemoteState::Failed(error),
+                };
+                self.remote_sessions.insert(host, state);
+            }
             Message::ResumeSession(index) => {
                 let Some(saved) = self
                     .saved_sessions
@@ -504,13 +537,57 @@ impl App {
                 else {
                     return Task::none();
                 };
-                self.set_show_context(false);
-                if let Some(open) = self.chat_index_for_session(saved.agent, &saved.id) {
+                return self.resume_saved(saved);
+            }
+            Message::ResumeRemote(host, index) => {
+                let saved = match self.remote_sessions.get(&host) {
+                    Some(RemoteState::Loaded(listing)) => listing.sessions.get(index).cloned(),
+                    _ => None,
+                };
+                if let Some(saved) = saved {
+                    return self.resume_saved(saved);
+                }
+            }
+            Message::AttachTmux(host, index) => {
+                let tmux = match self.remote_sessions.get(&host) {
+                    Some(RemoteState::Loaded(listing)) => listing.tmux.get(index).cloned(),
+                    _ => None,
+                };
+                let Some(tmux) = tmux else {
+                    return Task::none();
+                };
+                self.panel = Panel::None;
+                if let Some(open) = self.chats.iter().position(|chat| {
+                    chat.host.as_deref() == Some(host.as_str()) && chat.tmux.as_deref() == Some(tmux.name.as_str())
+                }) {
                     self.focused = open;
+                    // Encerrado (rede caída, por exemplo), volta a entrar no mesmo tmux.
+                    if !self.chats[open].is_alive() {
+                        return self.update(Message::ReopenChat);
+                    }
                     return self.focus_chat();
                 }
+                let title = claude::title_from_terminal(&tmux.title).unwrap_or_else(|| tmux.name.clone());
                 let id = self.take_terminal_id();
-                return self.open_chat(self.chats.len(), Chat::resume(id, &saved, self.new_model(saved.agent)));
+                let chat = Chat::attach(id, host, tmux.name, PathBuf::from(tmux.path), short_title(&title));
+                return self.open_chat(self.chats.len(), chat);
+            }
+            Message::KillRemote => {
+                let Some(chat) = self.chats.get(self.focused) else {
+                    return Task::none();
+                };
+                let (Some(host), Some(tmux)) = (chat.host.clone(), chat.tmux.clone()) else {
+                    return Task::none();
+                };
+                self.remote_sessions.remove(&host);
+                let close = self.close_chat(self.focused);
+                let kill = cosmic::task::future(async move { Message::RemoteKilled(remote::kill(host, tmux).await) });
+                return Task::batch([close, kill]);
+            }
+            Message::RemoteKilled(result) => {
+                if let Err(error) = result {
+                    self.notice = Some(format!("não consegui encerrar na VPS: {error}"));
+                }
             }
             Message::SubChat => {
                 let id = self.take_terminal_id();
@@ -532,10 +609,14 @@ impl App {
                 let Some(chat) = self.chats.get(self.focused) else {
                     return Task::none();
                 };
+                let id = chat.id;
+                // Na VPS, o terminal do Omarchy entra no mesmo tmux: não depende do histórico.
+                if chat.host.is_some() {
+                    return self.update(Message::OpenInTerminalChecked(id, true));
+                }
                 let Some(session_id) = chat.session_id.clone() else {
                     return Task::none();
                 };
-                let id = chat.id;
                 let agent = chat.agent;
                 return cosmic::task::future(async move {
                     let saved = tokio::task::spawn_blocking(move || agent.session_file(&session_id).is_some())
@@ -549,13 +630,19 @@ impl App {
                     return Task::none();
                 };
                 let chat = &self.chats[index];
-                let Some(session_id) = chat.session_id.clone().filter(|_| saved) else {
-                    self.notice = Some("a sessão ainda não foi salva: mande uma mensagem antes.".into());
-                    return Task::none();
-                };
                 let pid = chat.pid();
-                let cwd = chat.cwd.clone();
-                let command = chat.agent.command(&Start::Resume { session_id }, chat.model.as_deref(), None);
+                let cwd = chat.local_dir();
+                let command = if chat.host.is_some() {
+                    // Fechar o chat só desconecta; o terminal novo entra no mesmo tmux da VPS.
+                    let mut copy = chat.reopen(0).expect("chat da VPS sempre reabre");
+                    copy.command()
+                } else {
+                    let Some(session_id) = chat.session_id.clone().filter(|_| saved) else {
+                        self.notice = Some("a sessão ainda não foi salva: mande uma mensagem antes.".into());
+                        return Task::none();
+                    };
+                    chat.agent.command(&Start::Resume { session_id }, chat.model.as_deref(), None, chat.auto)
+                };
                 let close = self.close_chat(index);
                 let open = cosmic::task::future(async move {
                     Message::OpenedInTerminal(open_in_terminal(pid, cwd, command).await)
@@ -564,43 +651,27 @@ impl App {
             }
             Message::OpenedInTerminal(result) => {
                 if let Err(error) = result {
-                    self.notice = Some(format!("não consegui abrir o COSMIC Terminal: {error}"));
+                    self.notice = Some(format!("não consegui abrir o terminal do Omarchy: {error}"));
                 }
             }
             Message::ModeMenu(open) => self.mode_menu = open,
-            Message::ThemeMenu(open) => self.theme_menu = open,
-            Message::SetTheme(index) => {
-                self.theme_menu = false;
-                let Some(chosen) = Theme::ALL.get(index).copied() else {
-                    return Task::none();
-                };
-                chosen.make_current();
-                if let Err(error) = chosen.save() {
-                    log::error!("não consegui gravar o tema: {error}");
+            Message::CheckTheme => {
+                if !self.checking_theme {
+                    self.checking_theme = true;
+                    return cosmic::task::future(async {
+                        let fingerprint = tokio::task::spawn_blocking(omarchy::theme_fingerprint)
+                            .await
+                            .unwrap_or_default();
+                        Message::ThemeChecked(fingerprint)
+                    });
                 }
-                // Os terminais abertos trocam de cor na hora; os novos já nascem com o tema.
-                let cosmic_theme = chosen.cosmic();
-                let chats = self.chats.iter().filter_map(|chat| chat.terminal.as_ref());
-                let tabs = self
-                    .terminal_tabs
-                    .iter()
-                    .filter_map(|entity| self.terminal_tabs.data::<Mutex<Terminal>>(entity));
-                for terminal in chats.chain(tabs) {
-                    term::apply_theme(&mut terminal.lock().unwrap(), &cosmic_theme);
-                }
-                // Tema opaco não pede desfoque à extensão do GNOME (gastaria a GPU à toa).
-                self.apply_blur();
-                return cosmic::command::set_theme(cosmic_theme);
             }
-            Message::ToggleBlur => {
-                let on = !themes::blur();
-                themes::set_blur(on);
-                if let Err(error) = themes::save_blur(on) {
-                    log::error!("não consegui gravar o desfoque: {error}");
+            Message::ThemeChecked(fingerprint) => {
+                self.checking_theme = false;
+                if fingerprint != self.theme_fingerprint {
+                    self.theme_fingerprint = fingerprint;
+                    return self.apply_omarchy_theme();
                 }
-                self.apply_blur();
-                // Reaplicar o tema faz o libcosmic refazer o pedido de blur da janela.
-                return cosmic::command::set_theme(Theme::current().cosmic());
             }
             Message::SetMode(index) => {
                 self.mode_menu = false;
@@ -709,13 +780,14 @@ impl App {
                 let _ = std::process::Command::new("xdg-open").arg(url).spawn();
             }
             Message::RefreshInfo => return self.refresh_usage(),
-            Message::UsageFetched(result) => {
+            Message::UsageFetched(result, codex_limits, fetched) => {
                 self.fetching_usage = false;
+                self.codex_usage = codex_limits;
                 match result {
                     Ok(limits) => {
                         self.limits = limits;
                         self.usage_error = None;
-                        self.usage_updated = Some(now_hms());
+                        self.usage_updated = Some(fetched.unwrap_or_else(now_hms));
                     }
                     Err(error) => self.usage_error = Some(error),
                 }
@@ -805,16 +877,117 @@ impl App {
                 };
                 return Task::batch([show, focus]);
             }
-            Message::DragWindow => return self.core.drag(None),
-            Message::ToggleMaximize => return self.core.toggle_maximize(None),
-            Message::Minimize => return self.core.minimize(None),
-            Message::CloseWindow => {
-                if let Some(id) = self.core.main_window_id() {
-                    return cosmic::iced::window::close(id);
-                }
-            }
         }
         Task::none()
+    }
+
+    /// Para conferir a interface por captura de tela, sem clicar: `CHUBE_DEBUG_PANEL=new` abre
+    /// o painel de nova sessão (`new:<host>` já com o host do SSH), `sessions` o de sessões
+    /// desta máquina e `sessions:<host>` o de um host.
+    fn debug_panel(&mut self) -> Task<Message> {
+        let Ok(value) = std::env::var("CHUBE_DEBUG_PANEL") else {
+            return Task::none();
+        };
+        let (panel, host) = value.split_once(':').map_or((value.as_str(), None), |(panel, host)| (panel, Some(host.to_owned())));
+        match panel {
+            "new" => {
+                let task = self.update(Message::NewChat);
+                self.new_chat_host = host;
+                task
+            }
+            "sessions" => {
+                self.panel = Panel::Sessions;
+                self.update(Message::SessionsHost(host))
+            }
+            _ => Task::none(),
+        }
+    }
+
+    /// O agente e o modo de uma escolha do painel de nova sessão; `None` se o agente padrão do
+    /// Omarchy não é o Claude Code nem o Codex.
+    fn launch_agent(&self, launch: Launch) -> Option<(Agent, bool)> {
+        match launch {
+            Launch::Omarchy => self.omarchy_agent.map(|agent| (agent, true)),
+            Launch::Claude => Some((Agent::Claude, false)),
+            Launch::Codex => Some((Agent::Codex, false)),
+        }
+    }
+
+    /// Pasta do chat novo nesta máquina. Vazio é a pasta do chat em foco ou, no modo do Omarchy,
+    /// a mesma do `omarchy agent` (`~/Work`).
+    fn new_chat_dir(&self) -> Result<PathBuf, String> {
+        if self.new_chat_input.trim().is_empty() {
+            return Ok(if self.new_chat_launch == Launch::Omarchy {
+                omarchy::work_dir()
+            } else {
+                self.focused_local_dir()
+            });
+        }
+        dirs::resolve(&self.new_chat_input, &self.focused_local_dir())
+    }
+
+    /// Pasta do chat em foco, se ele é desta máquina; senão a padrão.
+    fn focused_local_dir(&self) -> PathBuf {
+        match self.chats.get(self.focused) {
+            Some(chat) if chat.host.is_none() => chat.cwd.clone(),
+            _ => self.default_dir.clone(),
+        }
+    }
+
+    /// Carrega as sessões do lugar escolhido no painel (desta máquina ou da VPS).
+    fn load_sessions(&mut self) -> Task<Message> {
+        match self.sessions_host.clone() {
+            None => {
+                self.saved_sessions = None;
+                cosmic::task::future(async {
+                    let list = tokio::task::spawn_blocking(|| {
+                        let mut list = sessions::list();
+                        list.extend(codex::list());
+                        list.sort_by(|a, b| b.modified.cmp(&a.modified));
+                        list
+                    })
+                    .await
+                    .unwrap_or_default();
+                    Message::SessionsLoaded(list)
+                })
+            }
+            Some(host) => {
+                self.remote_sessions.insert(host.clone(), RemoteState::Loading);
+                cosmic::task::future(async move {
+                    let result = remote::list(host.clone()).await;
+                    Message::RemoteListed(host, result)
+                })
+            }
+        }
+    }
+
+    /// Abre uma sessão salva (daqui ou da VPS), ou foca o chat que já a tem aberta.
+    fn resume_saved(&mut self, saved: SavedSession) -> Task<Message> {
+        self.panel = Panel::None;
+        if let Some(open) = self.chat_index_for_session(saved.agent, &saved.id) {
+            self.focused = open;
+            return self.focus_chat();
+        }
+        let id = self.take_terminal_id();
+        let chat = Chat::resume(id, &saved, self.new_model(saved.agent));
+        self.open_chat(self.chats.len(), chat)
+    }
+
+    /// Relê o tema do Omarchy e o aplica na interface e nos terminais abertos.
+    fn apply_omarchy_theme(&mut self) -> Task<Message> {
+        let palette = themes::reload();
+        let cosmic_theme = palette.cosmic();
+        let chats = self.chats.iter().filter_map(|chat| chat.terminal.as_ref());
+        let tabs = self
+            .terminal_tabs
+            .iter()
+            .filter_map(|entity| self.terminal_tabs.data::<Mutex<Terminal>>(entity));
+        for terminal in chats.chain(tabs) {
+            if let Ok(mut terminal) = terminal.lock() {
+                term::apply_theme(&mut terminal, &cosmic_theme);
+            }
+        }
+        cosmic::command::set_theme(cosmic_theme)
     }
 
     /// Tira o chat da lista. Descartar o `Terminal` fecha o PTY, e o `claude` recebe SIGHUP:
@@ -840,16 +1013,30 @@ impl App {
         self.next_terminal_id
     }
 
-    /// Busca os limites com o `/usage`, se já não houver uma busca em andamento.
+    /// Lê os limites que o Omarchy mantém (`omarchy agent usage`) ou, sem eles, roda o
+    /// `/usage`, se já não houver uma busca em andamento.
     fn refresh_usage(&mut self) -> Task<Message> {
-        if self.chats.get(self.focused).map_or(self.default_agent, |chat| chat.agent) == Agent::Codex {
-            return self.poll();
-        }
         if self.fetching_usage {
             return Task::none();
         }
         self.fetching_usage = true;
-        cosmic::task::future(async { Message::UsageFetched(usage::fetch().await) })
+        self.account = omarchy::active_account("claude");
+        cosmic::task::future(async {
+            let (claude, codex) = tokio::task::spawn_blocking(|| (omarchy::usage("claude"), omarchy::usage("codex")))
+                .await
+                .unwrap_or((None, None));
+            let codex = codex.map(|usage| usage.limits);
+            match claude {
+                Some(usage) => {
+                    let fetched = usage.fetched.map(|time| {
+                        let time = time.format("%H:%M").to_string();
+                        if usage.stale { format!("{time} (desatualizado)") } else { time }
+                    });
+                    Message::UsageFetched(Ok(usage.limits), codex, fetched)
+                }
+                None => Message::UsageFetched(usage::fetch().await, codex, None),
+            }
+        })
     }
 
     /// Busca a janela de contexto do modelo do chat em foco, se ainda não foi buscada.
@@ -907,13 +1094,14 @@ impl App {
             return Task::none();
         }
         self.notice = None;
-        self.new_chat_input = None;
+        self.panel = Panel::None;
         self.chat_visible = true;
         self.rebuild_panes();
         let mut tasks = Vec::new();
         for directory in flags.directories {
             let id = self.take_terminal_id();
-            let chat = Chat::new(id, flags.agent, PathBuf::from(directory), flags.model.clone(), None);
+            let chat = Chat::new(id, flags.agent, PathBuf::from(directory), flags.model.clone(), None)
+                .with_place(flags.auto, None);
             tasks.push(self.open_chat(self.chats.len(), chat));
         }
         Task::batch(tasks)
@@ -924,10 +1112,9 @@ impl App {
         (agent == self.default_agent).then(|| self.model.clone()).flatten()
     }
 
+    /// Pasta do chat em foco nesta máquina (a padrão, se ele é da VPS).
     fn focused_dir(&self) -> PathBuf {
-        self.chats
-            .get(self.focused)
-            .map_or_else(|| self.default_dir.clone(), |chat| chat.cwd.clone())
+        self.focused_local_dir()
     }
 
     /// Põe o chat na lista, em `index`, abre o `claude` dele e o deixa em foco.
@@ -947,8 +1134,8 @@ impl App {
         if chat.terminal.is_some() || !chat.is_alive() || chat.status == Status::Suspended {
             return;
         }
-        let command = chat.agent.command(&chat.start, chat.model.as_deref(), chat.prompt.take().as_deref());
-        match term::spawn(chat.id, events, chat.cwd.clone(), Some(command), &theme::active()) {
+        let command = chat.command();
+        match term::spawn(chat.id, events, chat.local_dir(), Some(command), &theme::active()) {
             Ok(terminal) => chat.terminal = Some(terminal),
             Err(err) => {
                 log::error!("não consegui abrir {}: {err}", chat.agent.label());
@@ -976,7 +1163,9 @@ impl App {
             .chats
             .iter()
             .enumerate()
-            .filter(|(_, chat)| chat.session_id.is_some() || matches!(chat.start, Start::New { .. }))
+            .filter(|(_, chat)| {
+                chat.session_id.is_some() || matches!(chat.start, Start::New { .. }) || chat.attach_only
+            })
             .collect();
         let open = OpenChats {
             focused: with_id
@@ -987,11 +1176,18 @@ impl App {
                 .iter()
                 .map(|(_, chat)| OpenChat {
                     agent: chat.agent,
-                    session_id: chat.session_id.clone().unwrap_or_else(|| format!("draft:{}", chat.id)),
+                    session_id: match (&chat.session_id, &chat.tmux) {
+                        (_, Some(tmux)) if chat.attach_only => format!("{TMUX_ID_PREFIX}{tmux}"),
+                        (Some(id), _) => id.clone(),
+                        (None, _) => format!("draft:{}", chat.id),
+                    },
                     cwd: chat.cwd.clone(),
                     title: chat.title.clone(),
                     model: chat.model.clone(),
                     parent: chat.parent.clone(),
+                    auto: chat.auto,
+                    host: chat.host.clone(),
+                    tmux: chat.tmux.clone(),
                 })
                 .collect(),
         };
@@ -1068,7 +1264,8 @@ impl App {
         let targets: Vec<(term::TabId, Agent, Option<u32>, Option<String>, Option<String>)> = self
             .chats
             .iter()
-            .filter(|chat| chat.is_alive())
+            // Os da VPS não têm arquivos aqui: o status vem do título do terminal.
+            .filter(|chat| chat.is_alive() && chat.host.is_none())
             .map(|chat| (chat.id, chat.agent, chat.pid(), chat.session_id.clone(), chat.codex_thread_hint.clone()))
             .collect();
         self.polling = true;
@@ -1211,6 +1408,17 @@ impl App {
     fn handle_term_event(&mut self, id: term::TabId, event: term::Event) -> Task<Message> {
         if let Some(chat) = self.chats.iter_mut().find(|chat| chat.id == id) {
             match event {
+                term::Event::Title(title) if chat.host.is_some() => {
+                    // Na VPS, o título do agente (repassado pelo tmux) dá o assunto e o status.
+                    if let Some(status) = claude::status_from_title(&title) {
+                        chat.status = status;
+                    } else if chat.status == Status::Starting {
+                        chat.status = Status::Ready;
+                    }
+                    if let Some(title) = claude::title_from_terminal(&title) {
+                        chat.title = short_title(&title);
+                    }
+                }
                 term::Event::Title(title) => {
                     if chat.agent == Agent::Codex {
                         if let Some(hint) = codex::title_hint(&title) {
@@ -1276,59 +1484,72 @@ impl App {
                 .spacing(theme::spacing().space_xxs)
                 .height(Length::Fill)
                 .into(),
-            Section::Chat => self.chat_section(),
+            Section::Chat => match self.panel {
+                Panel::NewChat => self.new_chat_section(),
+                Panel::Sessions => self.sessions_section(),
+                Panel::None => self.chat_section(),
+            },
             Section::Terminal => self.terminal_section(),
         }
     }
 
     fn chats_card(&self) -> Element<'_, Message> {
         let space = theme::spacing();
-        let colors = Colors::get();
+        let palette = themes::current();
 
-        let mut list = widget::Column::new();
+        let mut list = widget::Column::new().spacing(space.space_xxxs);
         for (index, chat) in self.chats.iter().enumerate() {
             let selected = index == self.focused;
-            let (glyph, color) = status_glyph(chat.status, &colors);
+            let (glyph, color) = status_glyph(chat.status);
             let title = if selected {
-                bold(chat.title.as_str()).class(theme::Text::Color(colors.accent))
+                bold(chat.title.as_str()).class(theme::Text::Color(palette.accent))
             } else {
                 mono(chat.title.as_str())
             };
+            let close_tip = if chat.host.is_some() {
+                "Desconectar (o agente continua na VPS)"
+            } else {
+                "Fechar este chat (como /exit)"
+            };
             let first = widget::Row::new()
-                .push(tinted(if selected { "> " } else { "  " }, colors.accent))
                 .push(tinted(format!("{glyph} "), color))
-                // Cortado no container: sem ele, o texto sem quebra passa por baixo do `[x]`.
+                // Cortado no container: sem ele, o texto sem quebra passa por baixo do botão.
                 .push(widget::container(title.wrapping(Wrapping::None)).width(Length::Fill).clip(true))
-                .push(ascii_button("[x]", "Fechar este chat (como /exit)", Some(Message::CloseChat(index))))
+                .push(icon_button(ICON_CLOSE, close_tip, Some(Message::CloseChat(index))))
                 .align_y(Alignment::Center);
             // Trabalhando / precisa de você ficam na cor do status; os outros, apagados.
             let status_color = match chat.status {
                 Status::Working | Status::Waiting => color,
-                _ => colors.dim,
+                _ => palette.dim,
             };
-            let second = widget::Row::new()
-                .push(tinted(format!("    {} · {} · ", chat.agent.label(), claude::display_path(&chat.cwd)), colors.dim).wrapping(Wrapping::None))
-                .push(tinted(chat.status.label(), status_color).wrapping(Wrapping::None));
+            let mut second = widget::Row::new().push(
+                tinted(format!("  {} · {} · ", chat.agent_label(), chat.place_label()), palette.dim)
+                    .wrapping(Wrapping::None),
+            );
+            second = second.push(tinted(chat.status.label(), status_color).wrapping(Wrapping::None));
             let item = widget::container(widget::Column::new().push(first).push(second))
                 .width(Length::Fill)
                 .clip(true);
             list = list.push(
-                flat_button(item, selected)
-                    .padding([space.space_xxxs, 0])
+                row_button(item, selected)
+                    .padding([space.space_xxxs, space.space_xxs])
                     .width(Length::Fill)
                     .on_press(Message::SelectChat(index)),
             );
         }
+        if self.chats.is_empty() {
+            list = list.push(tinted("nenhum chat aberto", palette.dim));
+        }
 
         let header = widget::Row::new()
-            .push(heading("chats"))
-            .push(tinted(format!(" [{}]", self.chats.len()), colors.dim))
+            .push(heading(ICON_CHATS, "chats"))
+            .push(tinted(format!(" {}", self.chats.len()), palette.dim))
             .push(horizontal_fill())
-            .push(ascii_button("[+]", "Nova sessão (Ctrl+Shift+N)", Some(Message::NewChat)))
-            .push(ascii_button("[≡]", "Sessões salvas", Some(Message::ShowSessions)))
+            .push(icon_button(ICON_NEW, "Nova sessão (Ctrl+Shift+N)", Some(Message::NewChat)))
+            .push(icon_button(ICON_HISTORY, "Sessões salvas", Some(Message::ShowSessions)))
             .push(shortcuts_help())
-            .push(ascii_button(
-                "[«]",
+            .push(icon_button(
+                ICON_HIDE_LEFT,
                 "Esconder o painel (Ctrl+Shift+1)",
                 Some(Message::HideSection(Section::Sidebar)),
             ))
@@ -1338,7 +1559,7 @@ impl App {
         card(
             widget::Column::new()
                 .push(section_header(header))
-                .push(widget::scrollable(list).height(Length::Fill))
+                .push(thin_scrollable(list))
                 .spacing(space.space_xxs),
         )
         .height(Length::FillPortion(3))
@@ -1347,11 +1568,19 @@ impl App {
 
     fn info_card(&self) -> Element<'_, Message> {
         let space = theme::spacing();
-        let colors = Colors::get();
+        let palette = themes::current();
         let focused = self.chats.get(self.focused);
+        let remote = focused.is_some_and(|chat| chat.host.is_some());
         let context_tokens = focused.map_or(0, |chat| chat.context_tokens);
         let is_codex = focused.is_some_and(|chat| chat.agent == Agent::Codex);
-        let limits = if is_codex { focused.map(|chat| chat.codex_limits.as_slice()).unwrap_or_default() } else { &self.limits };
+        let limits: &[Limit] = if is_codex {
+            match &self.codex_usage {
+                Some(limits) => limits,
+                None => focused.map(|chat| chat.codex_limits.as_slice()).unwrap_or_default(),
+            }
+        } else {
+            &self.limits
+        };
         let known_window = if is_codex { focused.and_then(|chat| chat.context_window) } else {
             focused.and_then(|chat| chat.active_model.as_ref())
                 .and_then(|model| self.context_windows.get(model).copied().flatten())
@@ -1363,18 +1592,18 @@ impl App {
             .count();
 
         let header = widget::Row::new()
-            .push(heading("uso"))
+            .push(heading(ICON_USAGE, "uso"))
             .push(horizontal_fill())
-            // Aqui e não em "# chats", que corta os últimos botões com o painel estreito.
-            .push(self.theme_selector())
-            .push(ascii_button(
-                "[↻]",
+            .push(icon_button(
+                ICON_REFRESH,
                 "Atualizar agora",
                 (!self.fetching_usage).then_some(Message::RefreshInfo),
             ))
             .align_y(Alignment::Center);
 
-        let context = if context_tokens == 0 || (is_codex && known_window.is_none()) {
+        let context = if remote {
+            meter("contexto", None, Some("na VPS".into()), None)
+        } else if context_tokens == 0 || (is_codex && known_window.is_none()) {
             meter("contexto", None, None, None)
         } else {
             // Enquanto o `/context` não responde, chuta 200 mil; acima disso, só pode ser 1 milhão
@@ -1392,14 +1621,14 @@ impl App {
         let mut body = widget::Column::new().push(context).spacing(space.space_xs);
         if limits.is_empty() {
             body = body
-                .push(meter("limite 5h", None, None, None))
-                .push(meter("limite semanal", None, None, None));
+                .push(meter("sessão (5h)", None, None, None))
+                .push(meter("semana", None, None, None));
         }
         for limit in limits {
             let label = match &limit.window {
-                Window::Session => "limite 5h".to_owned(),
-                Window::Week(models) if models == "all models" => "limite semanal".to_owned(),
-                Window::Week(models) => format!("semanal ({models})"),
+                Window::Session => "sessão (5h)".to_owned(),
+                Window::Week(models) if models == "all models" => "semana".to_owned(),
+                Window::Week(models) => format!("semana · {}", models.to_lowercase()),
             };
             body = body.push(meter(
                 label,
@@ -1409,34 +1638,31 @@ impl App {
             ));
         }
 
-        let status = if is_codex {
-            tinted("Codex · limites do histórico; /status na sessão", colors.dim)
+        let status = if is_codex && self.codex_usage.is_none() {
+            tinted("codex · limites do histórico; /status na sessão", palette.dim)
         } else if self.fetching_usage {
-            tinted("atualizando…", colors.dim)
+            tinted("atualizando…", palette.dim)
         } else if let Some(error) = &self.usage_error {
-            tinted(format!("erro ao atualizar: {error}"), colors.danger)
+            tinted(format!("erro ao atualizar: {error}"), palette.danger)
         } else if let Some(time) = &self.usage_updated {
-            tinted(format!("atualizado {time} · a cada 3 min"), colors.dim)
+            tinted(format!("limites de {time}"), palette.dim)
         } else {
-            tinted("ainda não atualizado", colors.dim)
+            tinted("ainda não atualizado", palette.dim)
         };
-        body = body.push(
-            widget::Column::new()
-                .push(tinted(
-                    format!("{} chats · {working} trabalhando", self.chats.len()),
-                    colors.dim,
-                ))
-                .push(status),
-        );
+        let mut footer = widget::Column::new().push(tinted(
+            format!("{} chats · {working} trabalhando", self.chats.len()),
+            palette.dim,
+        ));
+        if let Some(account) = self.account.as_ref().filter(|_| !is_codex) {
+            footer = footer.push(tinted(format!("conta {account}"), palette.dim));
+        }
+        body = body.push(footer.push(status));
 
         card(
             widget::Column::new()
                 .push(section_header(header))
                 // Rola em vez de cortar quando a janela é baixa.
-                .push(
-                    widget::scrollable(body.padding([0, space.space_xs, 0, 0]))
-                        .height(Length::Fill),
-                )
+                .push(thin_scrollable(body.padding([0, space.space_xs, 0, 0])))
                 .spacing(space.space_xxs),
         )
         .height(Length::FillPortion(2))
@@ -1445,12 +1671,12 @@ impl App {
 
     fn chat_section(&self) -> Element<'_, Message> {
         let space = theme::spacing();
-        let colors = Colors::get();
+        let palette = themes::current();
         let Some(chat) = self.chats.get(self.focused) else {
             return self.no_chat_section();
         };
 
-        let mut details = vec![chat.agent.label().to_owned(), claude::display_path(&chat.cwd)];
+        let mut details = vec![chat.agent_label(), chat.place_label()];
         if let Some(model) = chat.active_model.as_ref().or(chat.model.as_ref()) {
             details.push(model.clone());
         }
@@ -1462,8 +1688,8 @@ impl App {
         if !self.sidebar_visible {
             header = header.push(show_sidebar_button());
         }
-        let can_fork = chat.session_id.is_some() && chat.status != Status::Starting;
-        let (glyph, color) = status_glyph(chat.status, &colors);
+        let can_fork = chat.session_id.is_some() && chat.status != Status::Starting && !chat.attach_only;
+        let (glyph, color) = status_glyph(chat.status);
         header = header
             .push(tinted(format!("{glyph} "), color))
             .push(
@@ -1471,31 +1697,39 @@ impl App {
                     .width(Length::Fill)
                     .clip(true),
             )
-            .push(ascii_button(
-                "[fork]",
+            .push(icon_button(
+                ICON_FORK,
                 "Criar sub-chat com o contexto deste chat",
                 can_fork.then_some(Message::SubChat),
             ))
-            .push(ascii_button(
-                "[term]",
-                "Continuar esta sessão no COSMIC Terminal (fecha o chat aqui)",
-                can_fork.then_some(Message::OpenInTerminal),
-            ))
-            .push(ascii_button(
-                "[exit]",
+            .push(icon_button(
+                ICON_TERMINAL,
+                "Continuar no terminal do Omarchy (fecha o chat aqui)",
+                (can_fork || chat.host.is_some()).then_some(Message::OpenInTerminal),
+            ));
+        if chat.host.is_some() {
+            header = header
+                .push(icon_button(ICON_STOP, "Encerrar o agente na VPS (mata o tmux)", Some(Message::KillRemote)))
+                .push(icon_button(
+                    ICON_CLOSE,
+                    "Desconectar (o agente continua na VPS)",
+                    Some(Message::CloseChat(self.focused)),
+                ));
+        } else {
+            header = header.push(icon_button(
+                ICON_CLOSE,
                 "Fechar este chat (como /exit)",
                 Some(Message::CloseChat(self.focused)),
-            ))
-            .push(self.chat_toggle_button());
-        if !self.terminal_visible {
-            header = header.push(window_controls());
+            ));
         }
+        header = header.push(self.chat_toggle_button());
+
         let mut second = widget::Row::new().push(
-            widget::container(tinted(format!("  {}", details.join(" · ")), colors.dim).wrapping(Wrapping::None))
+            widget::container(tinted(format!("  {}", details.join(" · ")), palette.dim).wrapping(Wrapping::None))
                 .width(Length::Fill)
                 .clip(true),
         );
-        if chat.is_alive() && chat.agent == Agent::Claude {
+        if chat.is_alive() && chat.agent == Agent::Claude && chat.host.is_none() {
             second = second.push(self.mode_selector(chat.mode));
         }
         let header = widget::Column::new()
@@ -1504,22 +1738,18 @@ impl App {
 
         let mut column = widget::Column::new().push(section_header(header));
         if let Some(notice) = &self.notice {
-            column = column.push(tinted(format!("! {notice}"), colors.warning));
+            column = column.push(tinted(format!("{ICON_WARNING} {notice}"), palette.warning));
         }
         if !chat.is_alive() {
-            let text = if chat.terminal.is_some() {
-                "o agente desta sessão foi encerrado."
-            } else {
-                "não consegui abrir o agente."
+            let (text, action) = match (chat.terminal.is_some(), chat.host.is_some()) {
+                (true, true) => ("conexão com a VPS encerrada.", "reconectar"),
+                (true, false) => ("o agente desta sessão foi encerrado.", "reabrir sessão"),
+                (false, _) => ("não consegui abrir o agente.", "tentar de novo"),
             };
             column = column.push(
                 widget::Row::new()
-                    .push(tinted(format!("× {text}"), colors.warning).width(Length::Fill))
-                    .push(ascii_button(
-                        "[reabrir sessão]",
-                        "Retomar ou reiniciar esta sessão",
-                        Some(Message::ReopenChat),
-                    ))
+                    .push(tinted(format!("{ICON_EXITED} {text}"), palette.warning).width(Length::Fill))
+                    .push(text_button(action, "Retomar ou reiniciar esta sessão", Some(Message::ReopenChat)))
                     .align_y(Alignment::Center),
             );
         }
@@ -1527,8 +1757,14 @@ impl App {
         let body: Element<'_, Message> = match &chat.terminal {
             Some(terminal) => terminal_view(terminal, self.chat_terminal_id.clone()),
             None => widget::container(tinted(
-                if chat.is_alive() { "iniciando o agente…" } else { "" },
-                colors.dim,
+                if chat.status == Status::Suspended {
+                    "em espera"
+                } else if chat.is_alive() {
+                    "iniciando o agente…"
+                } else {
+                    ""
+                },
+                palette.dim,
             ))
             .center(Length::Fill)
             .into(),
@@ -1539,87 +1775,31 @@ impl App {
 
     /// Modo de permissão, como no rodapé da TUI; Shift+Tab no terminal também troca.
     fn mode_selector(&self, mode: Option<Mode>) -> Element<'_, Message> {
-        let colors = Colors::get();
+        let palette = themes::current();
         let label = match mode {
-            Some(mode) => format!("[{} {} ▾]", mode_glyph(mode), Mode::LABELS[mode.index()].to_lowercase()),
-            None => "[modo ▾]".to_owned(),
+            Some(mode) => format!("{} {} {ICON_DOWN}", mode_glyph(mode), Mode::LABELS[mode.index()].to_lowercase()),
+            None => format!("modo {ICON_DOWN}"),
         };
-        let button = flat_button(mono(label), self.mode_menu)
+        let button = row_button(mono(label), self.mode_menu)
+            .padding([0, 4])
             .on_press(Message::ModeMenu(!self.mode_menu));
         let mut popover = widget::popover(button)
             .position(widget::popover::Position::Bottom)
             .on_close(Message::ModeMenu(false));
         if self.mode_menu {
-            let mut menu = widget::Column::new();
+            let mut menu = widget::Column::new().spacing(2);
             for (index, candidate) in Mode::ALL.iter().enumerate() {
                 let current = mode == Some(*candidate);
-                let row = widget::Row::new()
-                    .push(tinted(if current { "> " } else { "  " }, colors.accent))
-                    .push(mono(format!("{} {}", mode_glyph(*candidate), Mode::LABELS[index].to_lowercase())));
+                let text = format!("{} {}", mode_glyph(*candidate), Mode::LABELS[index].to_lowercase());
+                let label = if current { tinted(text, palette.accent) } else { mono(text) };
                 menu = menu.push(
-                    flat_button(row, current)
+                    row_button(label, current)
+                        .padding([2, 6])
                         .width(Length::Fill)
                         .on_press(Message::SetMode(index)),
                 );
             }
             popover = popover.popup(menu_card(menu).width(Length::Fixed(220.0)));
-        }
-        popover.into()
-    }
-
-    /// Sem nenhum `Auto`, o libcosmic não pede o blur ao compositor nem usa as cores
-    /// translúcidas do tema, mesmo com o "frosted" ligado nele. No GNOME, o pedido vai para a
-    /// extensão `desfoque-chube@pedro`, por arquivo, com a intensidade do tema.
-    fn apply_blur(&mut self) {
-        self.core.set_auto_blur(if themes::blur() {
-            Auto::System | Auto::Popup | Auto::Window
-        } else {
-            Default::default()
-        });
-        let request = match Theme::current().palette() {
-            Some(palette) => palette.blur,
-            None => {
-                let theme = theme::active();
-                (theme.cosmic().background(theme.transparent).base.alpha < 1.0).then_some(themes::DOCK_BLUR)
-            }
-        };
-        // Com a janela maximizada, o libcosmic deixa os cantos retos, e a extensão também.
-        let corner = window_corner_radius(&Theme::current().cosmic());
-        if let Err(error) = themes::save_blur_request(request.filter(|_| themes::blur()), corner) {
-            log::error!("não consegui gravar o pedido de desfoque: {error}");
-        }
-    }
-
-    /// `[◐]` com o menu de temas e a opção do desfoque.
-    fn theme_selector(&self) -> Element<'_, Message> {
-        let colors = Colors::get();
-        let current = Theme::current();
-        let button = tooltip::tooltip(
-            flat_button(mono("[◐]"), self.theme_menu).on_press(Message::ThemeMenu(!self.theme_menu)),
-            widget::text::body(format!("Tema: {}", current.label())),
-            tooltip::Position::Bottom,
-        );
-        let mut popover = widget::popover(button)
-            .position(widget::popover::Position::Bottom)
-            .on_close(Message::ThemeMenu(false));
-        if self.theme_menu {
-            let mut menu = widget::Column::new().push(tinted("tema", colors.dim));
-            for (index, theme) in Theme::ALL.iter().enumerate() {
-                let selected = *theme == current;
-                let row = widget::Row::new()
-                    .push(tinted(if selected { "> " } else { "  " }, colors.accent))
-                    .push(mono(theme.label()));
-                menu = menu.push(
-                    flat_button(row, selected)
-                        .width(Length::Fill)
-                        .on_press(Message::SetTheme(index)),
-                );
-            }
-            let blur = if themes::blur() { "[x] desfoque" } else { "[ ] desfoque" };
-            menu = menu
-                .push(tinted("fundo", colors.dim))
-                .push(flat_button(mono(blur), false).width(Length::Fill).on_press(Message::ToggleBlur));
-            popover = popover.popup(menu_card(menu).width(Length::Fixed(160.0)));
         }
         popover.into()
     }
@@ -1662,34 +1842,31 @@ impl App {
         column.push(editor).into()
     }
 
-    /// Seção do chat depois de fechar o último.
+    /// Seção do chat sem nenhum chat aberto.
     fn no_chat_section(&self) -> Element<'_, Message> {
         let space = theme::spacing();
-        let colors = Colors::get();
+        let palette = themes::current();
         let mut header = widget::Row::new();
         if !self.sidebar_visible {
             header = header.push(show_sidebar_button());
         }
         header = header
-            .push(heading("nenhum chat aberto"))
+            .push(heading(ICON_CHATS, "nenhum chat aberto"))
             .push(horizontal_fill())
             .push(self.chat_toggle_button())
             .spacing(space.space_xxxs)
             .align_y(Alignment::Center);
-        if !self.terminal_visible {
-            header = header.push(window_controls());
-        }
         let notice = self
             .notice
             .as_ref()
-            .map(|notice| tinted(format!("! {notice}"), colors.warning));
+            .map(|notice| tinted(format!("{ICON_WARNING} {notice}"), palette.warning));
         let body = widget::container(
             widget::Column::new()
                 .push_maybe(notice)
-                .push(tinted("$ chube --novo", colors.dim))
-                .push(ascii_button("[+] nova sessão", "Abrir Claude Code ou Codex numa pasta", Some(Message::NewChat)))
-                .push(ascii_button("[≡] sessões salvas", "Retomar uma sessão", Some(Message::ShowSessions)))
-                .spacing(space.space_xxs),
+                .push(text_button("nova sessão", "Abrir o agente do Omarchy, o Claude Code ou o Codex", Some(Message::NewChat)))
+                .push(text_button("sessões salvas", "Retomar uma sessão daqui ou da VPS", Some(Message::ShowSessions)))
+                .spacing(space.space_xxs)
+                .align_x(Alignment::Center),
         )
         .center(Length::Fill);
         card(
@@ -1704,23 +1881,166 @@ impl App {
     /// Esconde o chat ou, com o terminal escondido, mostra o terminal.
     fn chat_toggle_button(&self) -> Element<'_, Message> {
         if self.terminal_visible {
-            ascii_button("[«]", "Esconder o chat (Ctrl+Shift+2)", Some(Message::HideSection(Section::Chat)))
+            icon_button(ICON_HIDE_LEFT, "Esconder o chat (Ctrl+Shift+2)", Some(Message::HideSection(Section::Chat)))
         } else {
-            ascii_button(
-                "[>_]",
+            icon_button(
+                ICON_TERMINAL,
                 "Mostrar o terminal (Ctrl+Shift+3)",
                 Some(Message::ShowSection(Section::Terminal)),
             )
         }
     }
 
-    fn sessions_list(&self) -> Element<'_, Message> {
-        let colors = Colors::get();
+    /// Cabeçalho dos painéis (nova sessão, sessões salvas), no lugar do do chat.
+    fn panel_header<'a>(&self, icon: &'static str, title: &'static str, extra: Option<Element<'a, Message>>) -> Element<'a, Message> {
+        let space = theme::spacing();
+        let mut row = widget::Row::new();
+        if !self.sidebar_visible {
+            row = row.push(show_sidebar_button());
+        }
+        row = row.push(heading(icon, title)).push(horizontal_fill());
+        if let Some(extra) = extra {
+            row = row.push(extra);
+        }
+        row = row.push(icon_button(ICON_CLOSE, "Voltar ao chat", Some(Message::ClosePanel)));
+        section_header(row.spacing(space.space_xxxs).align_y(Alignment::Center))
+    }
+
+    /// Painel de nova sessão, no estilo dos menus do Omarchy: agente, lugar e pasta, cada um com
+    /// o rótulo em cima e as opções quebrando a linha numa seção estreita.
+    fn new_chat_section(&self) -> Element<'_, Message> {
+        let space = theme::spacing();
+        let palette = themes::current();
+        let label = |text: &'static str| tinted(text, palette.dim);
+        let options = |items: Vec<Element<'static, Message>>| {
+            widget::flex_row(items).spacing(space.space_xxs)
+        };
+
+        let omarchy_label = match self.omarchy_agent {
+            Some(agent) => format!("{ICON_OMARCHY} omarchy ({})", agent.key()),
+            None => format!("{ICON_OMARCHY} omarchy"),
+        };
+        let agents = options(vec![
+            choice(omarchy_label, self.new_chat_launch == Launch::Omarchy, Message::NewChatLaunch(Launch::Omarchy)),
+            choice("claude".into(), self.new_chat_launch == Launch::Claude, Message::NewChatLaunch(Launch::Claude)),
+            choice("codex".into(), self.new_chat_launch == Launch::Codex, Message::NewChatLaunch(Launch::Codex)),
+        ]);
+
+        let mut place_items = vec![choice(
+            format!("{ICON_LAPTOP} local"),
+            self.new_chat_host.is_none(),
+            Message::NewChatHost(None),
+        )];
+        for host in &self.hosts {
+            let selected = self.new_chat_host.as_ref() == Some(host);
+            place_items.push(choice(format!("{ICON_SERVER} {host}"), selected, Message::NewChatHost(Some(host.clone()))));
+        }
+
+        let remote = self.new_chat_host.is_some();
+        let placeholder = match (remote, self.new_chat_launch) {
+            (true, _) => "pasta na VPS (vazio = ~)",
+            (false, Launch::Omarchy) => "pasta, atalho do fshort ou . (vazio = ~/Work)",
+            (false, _) => "pasta, atalho do fshort ou . (vazio = a do chat em foco)",
+        };
+        let input = widget::text_input(placeholder, &self.new_chat_input)
+            .id(self.new_chat_input_id.clone())
+            .font(mono_font())
+            .size(text_size())
+            .on_input(Message::NewChatInput)
+            .on_submit(|_| Message::NewChatConfirm);
+
+        let resolved: Result<String, String> = match &self.new_chat_host {
+            Some(host) => Ok(format!("{host}:{}", remote_dir(&self.new_chat_input))),
+            None => self.new_chat_dir().map(|path| claude::display_path(&path)),
+        };
+        let launchable = self.launch_agent(self.new_chat_launch).is_some();
+        let (preview, preview_color) = match (&resolved, launchable) {
+            (_, false) => ("o agente padrão do Omarchy não é o Claude Code nem o Codex".to_owned(), palette.danger),
+            (Ok(path), true) => (format!("{ICON_RIGHT} {path}"), palette.dim),
+            (Err(error), true) => (error.clone(), palette.danger),
+        };
+
+        let group = |title: &'static str, content: Element<'static, Message>| -> Element<'static, Message> {
+            widget::Column::new().push(label(title)).push(content).spacing(space.space_xxxs).into()
+        };
+        let mut folder = widget::Column::new()
+            .push(label("pasta"))
+            .push(input)
+            .push(tinted(preview, preview_color))
+            .spacing(space.space_xxxs);
+        if !remote {
+            let names: Vec<String> = dirs::shortcuts().into_iter().map(|(name, _)| name).collect();
+            if !names.is_empty() {
+                folder = folder.push(tinted(format!("atalhos: {}", names.join(", ")), palette.dim));
+            }
+        } else {
+            folder = folder.push(tinted(
+                "roda num tmux da VPS: fechar o chat só desconecta. A senha da chave é pedida no terminal.",
+                palette.dim,
+            ));
+        }
+        let mut actions = vec![
+            text_button(
+                "criar",
+                "Abrir o chat (Enter)",
+                (launchable && resolved.is_ok()).then_some(Message::NewChatConfirm),
+            ),
+            text_button("cancelar", "Voltar ao chat", Some(Message::ClosePanel)),
+        ];
+        if !remote {
+            actions.push(text_button("escolher pasta…", "Abrir o seletor de pastas", Some(Message::NewChatBrowse)));
+        }
+
+        let form = widget::Column::new()
+            .push(group("agente", agents.into()))
+            .push(group("onde", options(place_items).into()))
+            .push(folder)
+            .push(options(actions))
+            .spacing(space.space_s)
+            .max_width(640);
+
+        card(
+            widget::Column::new()
+                .push(self.panel_header(ICON_NEW, "nova sessão", None))
+                .push(thin_scrollable(form.padding([space.space_xs, space.space_xs])))
+                .spacing(space.space_xxs),
+        )
+        .into()
+    }
+
+    /// Painel das sessões salvas: desta máquina ou de um host do SSH.
+    fn sessions_section(&self) -> Element<'_, Message> {
+        let space = theme::spacing();
+        let mut tabs = widget::Row::new()
+            .push(choice(format!("{ICON_LAPTOP} local"), self.sessions_host.is_none(), Message::SessionsHost(None)))
+            .spacing(space.space_xxs)
+            .align_y(Alignment::Center);
+        for host in &self.hosts {
+            let selected = self.sessions_host.as_ref() == Some(host);
+            tabs = tabs.push(choice(format!("{ICON_SERVER} {host}"), selected, Message::SessionsHost(Some(host.clone()))));
+        }
+        let refresh = icon_button(ICON_REFRESH, "Recarregar", Some(Message::SessionsHost(self.sessions_host.clone())));
+        let body: Element<'_, Message> = match &self.sessions_host {
+            None => self.local_sessions_list(),
+            Some(host) => self.remote_sessions_list(host),
+        };
+        card(
+            widget::Column::new()
+                .push(self.panel_header(ICON_HISTORY, "sessões", Some(refresh)))
+                .push(tabs)
+                .push(thin_scrollable(body))
+                .spacing(space.space_xs),
+        )
+        .into()
+    }
+
+    fn local_sessions_list(&self) -> Element<'_, Message> {
+        let palette = themes::current();
         let Some(list) = &self.saved_sessions else {
-            return tinted("carregando…", colors.dim).into();
+            return tinted("carregando…", palette.dim).into();
         };
         if list.is_empty() {
-            return tinted("nenhuma sessão salva encontrada.", colors.dim).into();
+            return tinted("nenhuma sessão salva encontrada.", palette.dim).into();
         }
 
         // Agrupa por diretório; os grupos seguem a ordem da sessão mais recente de cada um.
@@ -1736,35 +2056,105 @@ impl App {
         for (dir, indices) in groups {
             let expanded = self.expanded_dirs.contains(dir);
             let header = widget::Row::new()
-                .push(tinted(if expanded { "▾ " } else { "▸ " }, colors.accent))
-                .push(bold(claude::display_path(dir)).width(Length::Fill))
-                .push(tinted(format!("[{}]", indices.len()), colors.dim));
+                .push(tinted(format!("{} ", if expanded { ICON_DOWN } else { ICON_RIGHT }), palette.accent))
+                .push(
+                    widget::container(bold(claude::display_path(dir)).wrapping(Wrapping::None))
+                        .width(Length::Fill)
+                        .clip(true),
+                )
+                .push(tinted(format!(" {}", indices.len()), palette.dim));
             column = column.push(
-                flat_button(header, false)
-                    .padding([theme::spacing().space_xxs, 0])
+                row_button(header, false)
+                    .padding([theme::spacing().space_xxs, theme::spacing().space_xxs])
                     .width(Length::Fill)
                     .on_press(Message::ToggleDirGroup(dir.clone())),
             );
             if expanded {
                 for index in indices {
-                    column = column.push(self.saved_session_item(index, &list[index]));
+                    column = column.push(self.saved_session_item(&list[index], Message::ResumeSession(index)));
                 }
             }
         }
         column.into()
     }
 
-    fn saved_session_item<'a>(&self, index: usize, saved: &'a SavedSession) -> Element<'a, Message> {
-        let colors = Colors::get();
+    fn remote_sessions_list<'a>(&'a self, host: &'a str) -> Element<'a, Message> {
+        let space = theme::spacing();
+        let palette = themes::current();
+        let listing = match self.remote_sessions.get(host) {
+            None | Some(RemoteState::Loading) => return tinted(format!("conectando a {host}…"), palette.dim).into(),
+            Some(RemoteState::Failed(error)) => {
+                return widget::Column::new()
+                    .push(tinted(format!("{ICON_WARNING} {error}"), palette.warning))
+                    .push(text_button("tentar de novo", "Conectar de novo", Some(Message::SessionsHost(Some(host.to_owned())))))
+                    .spacing(space.space_xxs)
+                    .into();
+            }
+            Some(RemoteState::Loaded(listing)) => listing,
+        };
+
+        let mut column = widget::Column::new()
+            .push(tinted(format!("tmux abertos em {host}"), palette.dim))
+            .spacing(space.space_xxxs);
+        if listing.tmux.is_empty() {
+            column = column.push(tinted("  nenhum", palette.dim));
+        }
+        for (index, tmux) in listing.tmux.iter().enumerate() {
+            let here = self
+                .chats
+                .iter()
+                .any(|chat| chat.host.as_deref() == Some(host) && chat.tmux.as_deref() == Some(tmux.name.as_str()) && chat.is_alive());
+            let title = claude::title_from_terminal(&tmux.title).unwrap_or_else(|| tmux.title.clone());
+            let mut details = vec![tmux.name.clone(), tmux.path.clone()];
+            if here {
+                details.push("aberto aqui".into());
+            } else if tmux.attached {
+                details.push("conectado em outro lugar".into());
+            }
+            let (glyph, color) = match claude::status_from_title(&tmux.title) {
+                Some(status) => status_glyph(status),
+                None => (ICON_TMUX, palette.dim),
+            };
+            let item = widget::Column::new()
+                .push(
+                    widget::Row::new()
+                        .push(tinted(format!("{glyph} "), color))
+                        .push(mono(title).wrapping(Wrapping::None)),
+                )
+                .push(tinted(format!("  {}", details.join(" · ")), palette.dim).wrapping(Wrapping::None));
+            column = column.push(
+                row_button(widget::container(item).clip(true), false)
+                    .padding([space.space_xxxs, space.space_xxs])
+                    .width(Length::Fill)
+                    .on_press(Message::AttachTmux(host.to_owned(), index)),
+            );
+        }
+
+        column = column.push(widget::Space::new().height(Length::Fixed(space.space_xs.into())));
+        column = column.push(tinted(format!("sessões salvas em {host}"), palette.dim));
+        if listing.sessions.is_empty() {
+            column = column.push(tinted("  nenhuma", palette.dim));
+        }
+        for (index, saved) in listing.sessions.iter().enumerate() {
+            column = column.push(self.saved_session_item(saved, Message::ResumeRemote(host.to_owned(), index)));
+        }
+        column.into()
+    }
+
+    fn saved_session_item<'a>(&self, saved: &'a SavedSession, on_press: Message) -> Element<'a, Message> {
+        let palette = themes::current();
         let open_here = self.chat_index_for_session(saved.agent, &saved.id).is_some();
-        let mut details = format!("{} · {}", saved.agent.label(), sessions::relative_time(saved.modified));
+        let mut details = vec![saved.agent.key().to_owned(), sessions::relative_time(saved.modified)];
+        if saved.host.is_some() {
+            details.push(saved.cwd.display().to_string());
+        }
         let blocked = match (&saved.running, open_here) {
             (_, true) => {
-                details.push_str(" · aberta aqui");
+                details.push("aberta aqui".into());
                 false
             }
             (Some(_), false) => {
-                details.push_str(" · aberta em outro terminal");
+                details.push("aberta em outro terminal".into());
                 true
             }
             (None, false) => false,
@@ -1774,52 +2164,48 @@ impl App {
             .map(|index| self.chats[index].status)
             .or_else(|| saved.running.as_deref().and_then(Status::from_claude));
         let (glyph, color) = match running {
-            Some(status) => status_glyph(status, &colors),
-            None => ("·", colors.dim),
+            Some(status) => status_glyph(status),
+            None => (ICON_IDLE, palette.dim),
         };
         let item = widget::Column::new()
             .push(
                 widget::Row::new()
-                    .push(tinted(format!("  {glyph} "), color))
-                    .push(mono(saved.title.as_str())),
+                    .push(tinted(format!("{glyph} "), color))
+                    .push(mono(saved.title.as_str()).wrapping(Wrapping::None)),
             )
-            .push(tinted(format!("    {details}"), colors.dim));
-        flat_button(item, false)
-            .padding([theme::spacing().space_xxxs, 0])
+            .push(tinted(format!("  {}", details.join(" · ")), palette.dim).wrapping(Wrapping::None));
+        row_button(widget::container(item).clip(true), false)
+            .padding([theme::spacing().space_xxxs, theme::spacing().space_xxs])
             .width(Length::Fill)
-            .on_press_maybe((!blocked).then_some(Message::ResumeSession(index)))
+            .on_press_maybe((!blocked).then_some(on_press))
             .into()
     }
 
     fn terminal_section(&self) -> Element<'_, Message> {
         let space = theme::spacing();
-        let colors = Colors::get();
+        let palette = themes::current();
 
         let toggle = if self.chat_visible {
-            ascii_button("[»]", "Esconder o terminal (Ctrl+Shift+3)", Some(Message::HideSection(Section::Terminal)))
+            icon_button(ICON_HIDE_RIGHT, "Esconder o terminal (Ctrl+Shift+3)", Some(Message::HideSection(Section::Terminal)))
         } else {
-            ascii_button("[«]", "Mostrar o chat (Ctrl+Shift+2)", Some(Message::ShowSection(Section::Chat)))
+            icon_button(ICON_HIDE_LEFT, "Mostrar o chat (Ctrl+Shift+2)", Some(Message::ShowSection(Section::Chat)))
         };
 
         // Abas com o nome da pasta do shell e um × para fechar.
         let active = self.terminal_tabs.active();
-        let mut tabs = widget::Row::new();
+        let mut tabs = widget::Row::new().spacing(space.space_xxxs);
         for (entity, name) in self.terminal_tabs.iter().zip(self.terminal_tab_names()) {
             let selected = entity == active;
-            let title = short_text(&name, TAB_TITLE_MAX_CHARS);
-            let label = if selected {
-                bold(title).class(theme::Text::Color(colors.accent))
-            } else {
-                mono(title)
-            }
-            .wrapping(Wrapping::None);
-            tabs = tabs
-                .push(flat_button(label, selected).on_press(Message::TerminalTabActivated(entity)))
+            let title = format!("{ICON_TERMINAL} {}", short_text(&name, TAB_TITLE_MAX_CHARS));
+            let label = if selected { tinted(title, palette.accent) } else { mono(title) }.wrapping(Wrapping::None);
+            let tab = widget::Row::new()
+                .push(row_button(label, selected).padding([1, 6]).on_press(Message::TerminalTabActivated(entity)))
                 .push(
-                    flat_button(tinted("×", colors.dim), selected)
+                    row_button(tinted(ICON_CLOSE, palette.dim), selected)
+                        .padding([1, 4])
                         .on_press(Message::TerminalTabClosed(entity)),
-                )
-                .push(mono(" "));
+                );
+            tabs = tabs.push(tab);
         }
 
         let mut header = widget::Row::new();
@@ -1828,11 +2214,9 @@ impl App {
         }
         let header = header
             .push(toggle)
-            .push(mono(" "))
             .push(
                 // A roda do mouse (vertical) rola as abas na horizontal; Shift+roda o scrollable
-                // já trata sozinho. Este `mouse_area` captura o clique esquerdo, que assim não
-                // chega ao do `section_header`: o arrasto e o clique duplo são repetidos aqui.
+                // já trata sozinho.
                 widget::mouse_area(
                     widget::scrollable(tabs)
                         .id(self.terminal_tabs_id.clone())
@@ -1841,8 +2225,6 @@ impl App {
                         ))
                         .width(Length::Fill),
                 )
-                .on_drag(Message::DragWindow)
-                .on_double_click(Message::ToggleMaximize)
                 .on_scroll(|delta| {
                     Message::TerminalTabsWheel(match delta {
                         cosmic::iced::mouse::ScrollDelta::Lines { y, .. } => -y * 60.0,
@@ -1850,17 +2232,16 @@ impl App {
                     })
                 }),
             )
-            .push(ascii_button("[+]", "Nova aba do terminal", Some(Message::NewTerminalTab)))
-            .push(window_controls())
-            .spacing(space.space_xxxs)
+            .push(icon_button(ICON_NEW, "Nova aba do terminal", Some(Message::NewTerminalTab)))
+            .spacing(space.space_xxs)
             .align_y(Alignment::Center);
 
         let body: Element<'_, Message> = match self.terminal_tabs.data::<Mutex<Terminal>>(active) {
             Some(terminal) => terminal_view(terminal, self.tab_terminal_id.clone()),
             None => widget::container(
                 widget::Column::new()
-                    .push(tinted("nenhum terminal aberto.", colors.dim))
-                    .push(ascii_button("[+] abrir terminal", "Abrir um shell", Some(Message::NewTerminalTab)))
+                    .push(tinted("nenhum terminal aberto.", palette.dim))
+                    .push(text_button("abrir terminal", "Abrir um shell", Some(Message::NewTerminalTab)))
                     .spacing(space.space_xxs)
                     .align_x(Alignment::Center),
             )
@@ -1878,145 +2259,112 @@ impl App {
     }
 }
 
-/// Cores do texto "de terminal": as da paleta do tema do Chube ou, no do sistema, as do COSMIC.
-#[derive(Clone, Copy)]
-struct Colors {
-    text: Color,
-    dim: Color,
-    accent: Color,
-    success: Color,
-    warning: Color,
-    danger: Color,
-    /// Fundo dos botões ao passar o mouse e selecionados (com alfa do botão).
-    highlight: Color,
-}
-
-impl Colors {
-    fn get() -> Self {
-        if let Some(palette) = Theme::current().palette() {
-            return Colors {
-                text: palette.text,
-                dim: palette.dim,
-                accent: palette.accent,
-                success: palette.success,
-                warning: palette.warning,
-                danger: palette.danger,
-                highlight: palette.highlight,
-            };
-        }
-        let theme = theme::active();
-        let cosmic = theme.cosmic();
-        let text = Color::from(cosmic.on_bg_color());
-        Colors {
-            text,
-            dim: Color { a: 0.5, ..text },
-            accent: cosmic.accent_text_color().into(),
-            success: cosmic.success_color().into(),
-            warning: cosmic.warning_color().into(),
-            danger: cosmic.destructive_color().into(),
-            highlight: text,
-        }
+/// O que o painel de nova sessão mostra para um agente escolhido sem o modo do Omarchy.
+fn launch_of(agent: Agent) -> Launch {
+    match agent {
+        Agent::Claude => Launch::Claude,
+        Agent::Codex => Launch::Codex,
     }
 }
 
-/// Fundo da janela. No tema do sistema, o mesmo do terminal, que assim não destoa; nos
-/// próprios, o da paleta (no neon e no vidro, um gradiente na diagonal). Com o desfoque
-/// desligado, opaco.
-fn window_background(theme: &cosmic::Theme) -> Background {
-    let Some(palette) = Theme::current().palette() else {
-        return Color::from(theme.cosmic().background(theme.transparent).base).into();
-    };
-    let solid = |color: Color| if themes::blur() { color } else { palette.solid(color) };
-    match palette.window_end {
-        Some(end) => cosmic::iced::gradient::Linear::new(Radians(2.4))
-            .add_stop(0.0, solid(palette.window))
-            .add_stop(1.0, solid(end))
-            .into(),
-        None => solid(palette.window).into(),
-    }
+/// Pasta da VPS como digitada; vazio é a home de lá.
+fn remote_dir(input: &str) -> String {
+    let input = input.trim();
+    if input.is_empty() { "~".into() } else { input.to_owned() }
 }
 
-/// Raio dos cantos da janela, com o mesmo cálculo do libcosmic (`window_corner_radius`, em
-/// `app/mod.rs`), que assim alinha o conteúdo com a borda.
-fn window_corner_radius(theme: &cosmic::Theme) -> f32 {
-    let radius = theme.cosmic().radius_s()[0];
-    if radius < 4.0 { radius } else { radius + 4.0 }
+// Ícones da Nerd Font (a JetBrainsMono Nerd Font do Omarchy tem todos), como na barra do Omarchy.
+const ICON_NEW: &str = "\u{f067}";
+const ICON_HISTORY: &str = "\u{f02da}";
+const ICON_HELP: &str = "\u{f059}";
+const ICON_HIDE_LEFT: &str = "\u{f053}";
+const ICON_HIDE_RIGHT: &str = "\u{f054}";
+const ICON_RIGHT: &str = "\u{f0da}";
+const ICON_DOWN: &str = "\u{f0d7}";
+const ICON_FORK: &str = "\u{e725}";
+const ICON_TERMINAL: &str = "\u{f489}";
+const ICON_CLOSE: &str = "\u{f0156}";
+const ICON_REFRESH: &str = "\u{f0450}";
+const ICON_SERVER: &str = "\u{f048b}";
+const ICON_LAPTOP: &str = "\u{f0322}";
+const ICON_OMARCHY: &str = "\u{f303}";
+const ICON_STOP: &str = "\u{f04d}";
+const ICON_CHATS: &str = "\u{f0b79}";
+const ICON_USAGE: &str = "\u{f080}";
+const ICON_WARNING: &str = "\u{f071}";
+const ICON_TMUX: &str = "\u{ebc8}";
+const ICON_IDLE: &str = "\u{f444}";
+const ICON_EXITED: &str = "\u{f057}";
+
+/// Rolagem vertical com a barra fina, como a dos menus do Omarchy.
+fn thin_scrollable<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    widget::scrollable(content)
+        .direction(scrollable::Direction::Vertical(
+            scrollable::Scrollbar::new().width(3).scroller_width(3),
+        ))
+        .height(Length::Fill)
+        .into()
 }
 
-/// Cor das bordas e linhas: a da paleta ou um cinza mais claro que o fundo.
-fn border_color(theme: &cosmic::Theme) -> Color {
-    match Theme::current().palette() {
-        Some(palette) => palette.border,
-        None => Color { a: 0.22, ..Color::from(theme.cosmic().on_bg_color()) },
-    }
+fn mono_font() -> Font {
+    Font::MONOSPACE
 }
 
-/// Seção: cantos retos e borda fina. Sem fundo próprio: o da janela (translúcido quando o
-/// tema tem blur) aparece por baixo, como nos espaços entre as seções. Pintar de novo
-/// dobraria o alfa e a seção ficaria opaca. Exceção: o tema neon, que tinge as seções de leve
-/// e acende um brilho em volta delas.
+/// Seção: cantos retos e uma borda fina e apagada, como a das janelas inativas do Hyprland. Sem
+/// fundo próprio: o da janela (translúcido no modo vidro) aparece por baixo; pintar de novo
+/// dobraria o alfa.
 fn card<'a>(content: impl Into<Element<'a, Message>>) -> widget::Container<'a, Message, cosmic::Theme> {
     widget::container(content)
         .padding(theme::spacing().space_xxs)
         .width(Length::Fill)
         .height(Length::Fill)
-        .class(theme::Container::custom(|theme| {
-            let palette = Theme::current().palette();
+        .class(theme::Container::custom(|_| {
+            let palette = themes::current();
             widget::container::Style {
-                background: palette.and_then(|palette| palette.card).map(Background::from),
                 border: Border {
-                    color: border_color(theme),
+                    color: Color { a: 0.35, ..palette.dim },
                     width: 1.0,
                     radius: 0.0.into(),
                 },
-                shadow: palette.and_then(|palette| palette.glow).map_or_else(Shadow::default, |color| Shadow {
-                    color,
-                    blur_radius: 16.0,
-                    ..Default::default()
-                }),
                 ..Default::default()
             }
         }))
 }
 
-/// Menu suspenso (modo, tema): como uma seção, mas com fundo opaco, porque abre por cima
-/// do conteúdo.
+/// Menu suspenso, como os popups do shell do Omarchy: fundo opaco e borda no acento.
 fn menu_card<'a>(content: impl Into<Element<'a, Message>>) -> widget::Container<'a, Message, cosmic::Theme> {
-    card(content).height(Length::Shrink).class(theme::Container::custom(|theme| {
-        let background = match Theme::current().palette() {
-            Some(palette) => palette.solid(palette.window),
-            None => theme.cosmic().background(false).base.into(),
-        };
-        widget::container::Style {
-            background: Some(background.into()),
-            border: Border {
-                color: border_color(theme),
-                width: 1.0,
-                radius: 0.0.into(),
-            },
-            ..Default::default()
-        }
-    }))
+    widget::container(content)
+        .padding(theme::spacing().space_xxs)
+        .class(theme::Container::custom(|_| {
+            let palette = themes::current();
+            widget::container::Style {
+                background: Some(palette.background.into()),
+                border: Border {
+                    color: palette.accent,
+                    width: 2.0,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            }
+        }))
 }
 
-/// Cabeçalho de seção com uma linha embaixo. Arrasta a janela (que não tem barra de título)
-/// e maximiza com clique duplo; os botões dentro dele continuam funcionando.
+/// Cabeçalho de seção com uma linha embaixo, todos da mesma altura (as linhas ficam alinhadas).
 fn section_header<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     let line = widget::container(widget::Space::new().width(Length::Fill).height(Length::Fixed(1.0)))
-        .class(theme::Container::custom(|theme| widget::container::Style {
-            background: Some(border_color(theme).into()),
-            ..Default::default()
+        .class(theme::Container::custom(|_| {
+            let palette = themes::current();
+            widget::container::Style {
+                background: Some(Color { a: 0.35, ..palette.dim }.into()),
+                ..Default::default()
+            }
         }));
     widget::Column::new()
         .push(
-            widget::mouse_area(
-                // Mesma altura em todas as seções, para as linhas de baixo ficarem alinhadas.
-                widget::container(content)
-                    .width(Length::Fill)
-                    .height(Length::Fixed(HEADER_HEIGHT)),
-            )
-                .on_drag(Message::DragWindow)
-                .on_double_click(Message::ToggleMaximize),
+            widget::container(content)
+                .width(Length::Fill)
+                .height(Length::Fixed(header_height()))
+                .align_y(Alignment::Center),
         )
         .push(line)
         .spacing(theme::spacing().space_xxs)
@@ -2024,13 +2372,13 @@ fn section_header<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, M
 }
 
 fn mono<'a>(text: impl Into<Cow<'a, str>> + 'a) -> widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
-    widget::text(text).font(cosmic::font::mono()).size(TEXT_SIZE)
+    widget::text(text).font(mono_font()).size(text_size())
 }
 
 fn bold<'a>(text: impl Into<Cow<'a, str>> + 'a) -> widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
     mono(text).font(Font {
         weight: Weight::Bold,
-        ..cosmic::font::mono()
+        ..mono_font()
     })
 }
 
@@ -2038,80 +2386,140 @@ fn tinted<'a>(text: impl Into<Cow<'a, str>> + 'a, color: Color) -> widget::Text<
     mono(text).class(theme::Text::Color(color))
 }
 
-/// Título de seção, como um cabeçalho de markdown: `# chats`.
-fn heading<'a>(text: &'a str) -> Element<'a, Message> {
+/// Título de seção: o ícone no acento e o nome em negrito.
+fn heading<'a>(icon: &'static str, text: &'a str) -> Element<'a, Message> {
     widget::Row::new()
-        .push(tinted("# ", Colors::get().accent))
+        .push(tinted(format!("{icon} "), themes::current().accent))
         .push(bold(text))
         .into()
 }
 
-/// Botão sem fundo nem cantos; o fundo aparece ao passar o mouse e quando selecionado.
-fn flat_button<'a>(content: impl Into<Element<'a, Message>>, selected: bool) -> widget::Button<'a, Message> {
-    let style = |_theme: &cosmic::Theme, alpha: f32, disabled: bool| {
-        let colors = Colors::get();
-        let text = if disabled { Color { a: 0.35, ..colors.text } } else { colors.text };
+/// Linha clicável, como as dos menus do Omarchy: sem fundo; ao passar o mouse, o texto a 8%;
+/// selecionada, o mesmo fundo e uma borda do texto a 25%.
+fn row_button<'a>(content: impl Into<Element<'a, Message>>, selected: bool) -> widget::Button<'a, Message> {
+    let style = move |hover: f32, disabled: bool| {
+        let palette = themes::current();
+        let text = if disabled { Color { a: 0.4, ..palette.text } } else { palette.text };
+        let fill = if selected { 0.08 } else { 0.0 } + hover;
         widget::button::Style {
-            background: (alpha > 0.0).then(|| Color { a: alpha, ..colors.highlight }.into()),
+            background: (fill > 0.0).then(|| palette.text_alpha(fill).into()),
             border_radius: 0.0.into(),
+            border_width: if selected { 1.0 } else { 0.0 },
+            border_color: palette.text_alpha(0.25),
             text_color: Some(text),
             icon_color: Some(text),
             ..widget::button::Style::new()
         }
     };
-    let base = if selected { 0.10 } else { 0.0 };
     widget::button::custom(content)
         .padding([0, 2])
         .class(theme::Button::Custom {
-            active: Box::new(move |_, theme| style(theme, base, false)),
-            hovered: Box::new(move |_, theme| style(theme, base + 0.08, false)),
-            pressed: Box::new(move |_, theme| style(theme, base + 0.16, false)),
-            disabled: Box::new(move |theme| style(theme, 0.0, true)),
+            active: Box::new(move |_, _| style(0.0, false)),
+            hovered: Box::new(move |_, _| style(0.08, false)),
+            pressed: Box::new(move |_, _| style(0.16, false)),
+            disabled: Box::new(move |_| style(0.0, true)),
         })
 }
 
-/// Botão de texto como `[+]`, com dica; sem mensagem, fica apagado.
-fn ascii_button<'a>(
-    label: &'static str,
-    tip: &'static str,
-    on_press: Option<Message>,
-) -> Element<'a, Message> {
-    tooltip::tooltip(
-        flat_button(mono(label), false).on_press_maybe(on_press),
-        widget::text::body(tip),
-        tooltip::Position::Bottom,
-    )
-    .into()
+/// Dica ao passar o mouse, como as do shell do Omarchy.
+fn tip<'a>(content: impl Into<Element<'a, Message>>, text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
+    let bubble = widget::container(mono(text))
+        .padding([2, 6])
+        .class(theme::Container::custom(|_| {
+            let palette = themes::current();
+            widget::container::Style {
+                background: Some(Color { a: 0.97, ..palette.background }.into()),
+                text_color: Some(palette.text),
+                border: Border {
+                    color: palette.text,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            }
+        }));
+    tooltip::tooltip(content, bubble, tooltip::Position::Bottom).into()
 }
 
-/// `[?]` com a lista de atalhos de teclado na dica.
+/// Botão de ícone (Nerd Font), apagado até passar o mouse; sem mensagem, fica desabilitado.
+fn icon_button<'a>(icon: &'static str, help: &'static str, on_press: Option<Message>) -> Element<'a, Message> {
+    let palette = themes::current();
+    let color = if on_press.is_some() { palette.dim } else { Color { a: 0.35, ..palette.dim } };
+    tip(
+        row_button(tinted(icon, color), false).padding([1, 5]).on_press_maybe(on_press),
+        help,
+    )
+}
+
+/// Botão de texto com borda, como os controles do shell do Omarchy (borda do texto a 40%).
+fn text_button<'a>(label: &'static str, help: &'static str, on_press: Option<Message>) -> Element<'a, Message> {
+    let enabled = on_press.is_some();
+    let style = move |hover: f32| {
+        let palette = themes::current();
+        let text = if enabled { palette.text } else { palette.text_alpha(0.4) };
+        widget::button::Style {
+            background: Some(palette.text_alpha(0.04 + hover).into()),
+            border_radius: 0.0.into(),
+            border_width: 1.0,
+            border_color: palette.text_alpha(if enabled { 0.4 } else { 0.15 }),
+            text_color: Some(text),
+            icon_color: Some(text),
+            ..widget::button::Style::new()
+        }
+    };
+    tip(
+        widget::button::custom(mono(label))
+            .padding([2, 10])
+            .class(theme::Button::Custom {
+                active: Box::new(move |_, _| style(0.0)),
+                hovered: Box::new(move |_, _| style(0.04)),
+                pressed: Box::new(move |_, _| style(0.14)),
+                disabled: Box::new(move |_| style(0.0)),
+            })
+            .on_press_maybe(on_press),
+        help,
+    )
+}
+
+/// Opção de um grupo (agente, lugar): a escolhida com o texto no acento e a borda da seleção.
+fn choice<'a>(label: String, selected: bool, on_press: Message) -> Element<'a, Message> {
+    let palette = themes::current();
+    let text = if selected { tinted(label, palette.accent) } else { mono(label) };
+    row_button(text, selected).padding([2, 8]).on_press(on_press).into()
+}
+
+/// `?` com a lista de atalhos de teclado na dica.
 fn shortcuts_help<'a>() -> Element<'a, Message> {
+    let palette = themes::current();
     let mut list = widget::Column::new();
     for (keys, shortcut) in shortcuts::LIST {
-        list = list.push(widget::text::body(format!("{keys:<14}{}", shortcut.label())).font(cosmic::font::mono()));
+        list = list.push(mono(format!("{keys:<14}{}", shortcut.label())));
     }
+    let bubble = widget::container(list)
+        .padding([4, 8])
+        .class(theme::Container::custom(|_| {
+            let palette = themes::current();
+            widget::container::Style {
+                background: Some(Color { a: 0.97, ..palette.background }.into()),
+                text_color: Some(palette.text),
+                border: Border {
+                    color: palette.text,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            }
+        }));
     tooltip::tooltip(
-        widget::container(tinted("[?]", Colors::get().dim)).padding([0, 2]),
-        list,
+        widget::container(tinted(ICON_HELP, palette.dim)).padding([1, 5]),
+        bubble,
         tooltip::Position::Bottom,
     )
     .into()
-}
-
-/// Minimizar, maximizar e fechar, que ficavam na barra de título.
-fn window_controls<'a>() -> Element<'a, Message> {
-    widget::Row::new()
-        .spacing(theme::spacing().space_xxxs)
-        .align_y(Alignment::Center)
-        .push(tinted("│", Colors::get().dim))
-        .push(ascii_button("–", "Minimizar", Some(Message::Minimize)))
-        .push(ascii_button("□", "Maximizar", Some(Message::ToggleMaximize)))
-        .push(ascii_button("×", "Fechar o C-hub", Some(Message::CloseWindow)))
-        .into()
 }
 
 fn show_sidebar_button<'a>() -> Element<'a, Message> {
-    ascii_button("[»]", "Mostrar o painel (Ctrl+Shift+1)", Some(Message::ShowSection(Section::Sidebar)))
+    icon_button(ICON_HIDE_RIGHT, "Mostrar o painel (Ctrl+Shift+1)", Some(Message::ShowSection(Section::Sidebar)))
 }
 
 /// Última pasta do caminho (`~/projects/chube` → `chube`); a home vira `~`.
@@ -2123,28 +2531,29 @@ fn dir_name(path: &std::path::Path) -> String {
         .map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
 }
 
-/// Símbolo e cor de cada status, no estilo da TUI do Claude Code.
-fn status_glyph(status: Status, colors: &Colors) -> (&'static str, Color) {
+/// Ícone e cor de cada status, com as cores do tema do Omarchy.
+fn status_glyph(status: Status) -> (&'static str, Color) {
+    let palette = themes::current();
     match status {
-        Status::Suspended => ("-", colors.dim),
-        Status::Starting => ("○", colors.dim),
-        Status::Working => ("✻", colors.accent),
-        Status::Waiting => ("?", colors.warning),
-        Status::Ready => ("●", colors.success),
-        Status::Exited => ("×", colors.dim),
+        Status::Suspended => ("\u{f04c}", palette.dim),
+        Status::Starting => ("\u{f10c}", palette.dim),
+        Status::Working => ("\u{f110}", palette.accent),
+        Status::Waiting => ("\u{f0f3}", palette.warning),
+        Status::Ready => ("\u{f111}", palette.success),
+        Status::Exited => (ICON_EXITED, palette.dim),
     }
 }
 
-/// Símbolo do modo, como no rodapé da TUI.
+/// Ícone do modo, como o símbolo do rodapé da TUI (⏸ / ⏵⏵).
 fn mode_glyph(mode: Mode) -> &'static str {
     match mode {
-        Mode::Manual | Mode::Plan => "⏸",
-        Mode::AcceptEdits | Mode::Auto | Mode::Bypass => "⏵⏵",
+        Mode::Manual | Mode::Plan => "\u{f04c}",
+        Mode::AcceptEdits | Mode::Auto | Mode::Bypass => "\u{f04e}",
     }
 }
 
 /// O terminal de um chat ou de uma aba, sem cantos arredondados.
-/// Opacidade 0 no fundo padrão: fica o da janela (com blur, se o tema tiver); células com
+/// Opacidade 0 no fundo padrão: fica o da janela (translúcido no modo vidro); células com
 /// cor de fundo própria continuam pintadas.
 fn terminal_view(terminal: &Mutex<Terminal>, id: widget::Id) -> Element<'_, Message> {
     term::terminal_box(terminal, &term::KEY_BINDS)
@@ -2156,11 +2565,11 @@ fn terminal_view(terminal: &Mutex<Terminal>, id: widget::Id) -> Element<'_, Mess
         .into()
 }
 
-/// Rótulo, detalhe e uma barra ASCII colorida, como os medidores do htop:
+/// Rótulo, detalhe e uma barra fina, como os medidores do shell do Omarchy:
 ///
 /// ```text
-/// contexto                 84,2k / 200k
-/// [||||||||||||||||                 42%]
+/// contexto            84,2k / 200k  42%
+/// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 /// └ reinicia em 3 h 1 min
 /// ```
 fn meter<'a>(
@@ -2169,53 +2578,49 @@ fn meter<'a>(
     detail: Option<String>,
     note: Option<String>,
 ) -> Element<'a, Message> {
-    let colors = Colors::get();
+    let palette = themes::current();
+    let value = value.map(|value| value.clamp(0.0, 1.0));
+    let color = meter_color(value.unwrap_or(0.0));
     let mut head = widget::Row::new().push(mono(label).width(Length::Fill));
     if let Some(detail) = detail {
-        head = head.push(tinted(detail, colors.dim));
+        head = head.push(tinted(format!("{detail}  "), palette.dim));
     }
-    // A quantidade de caracteres da barra depende da largura disponível.
-    let bar = widget::responsive(move |size| ascii_bar(value, size.width)).height(Length::Shrink);
+    head = head.push(match value {
+        Some(value) => tinted(format!("{:.0}%", value * 100.0), color),
+        None => tinted("—", palette.dim),
+    });
+    // A quantidade de traços depende da largura disponível.
+    let bar = widget::responsive(move |size| line_bar(value, size.width)).height(Length::Shrink);
     let mut column = widget::Column::new().push(head).push(bar);
     if let Some(note) = note {
-        column = column.push(tinted(format!("└ {note}"), colors.dim));
+        column = column.push(tinted(format!("└ {note}"), palette.dim));
     }
     column.into()
 }
 
-fn ascii_bar<'a>(value: Option<f32>, width: f32) -> Element<'a, Message> {
-    let colors = Colors::get();
-    let value = value.map(|value| value.clamp(0.0, 1.0));
-    let percent = match value {
-        Some(value) => format!("{:.0}%", value * 100.0),
-        None => "—".to_owned(),
-    };
-    // Colchetes e um caractere de folga, porque a largura da fonte é estimada.
-    let columns = (width / (TEXT_SIZE * MONO_ADVANCE)) as usize;
-    let cells = columns.saturating_sub(3).max(8);
+fn meter_color(ratio: f32) -> Color {
+    let palette = themes::current();
+    if ratio >= 0.9 {
+        palette.danger
+    } else if ratio >= 0.7 {
+        palette.warning
+    } else {
+        palette.accent
+    }
+}
+
+/// Barra de traços: a parte usada na cor do nível, o resto na cor de seleção do tema.
+fn line_bar<'a>(value: Option<f32>, width: f32) -> Element<'a, Message> {
+    let palette = themes::current();
+    let cells = ((width / (text_size() * MONO_ADVANCE)) as usize).saturating_sub(1).max(8);
     let ratio = value.unwrap_or(0.0);
     let mut filled = ((ratio * cells as f32).round() as usize).min(cells);
     if ratio > 0.0 {
         filled = filled.max(1);
     }
-    // A porcentagem fica dentro da barra, no fim; perto de 100%, cobre o fim das barras.
-    let label_len = percent.chars().count();
-    let bars = filled.min(cells - label_len);
-    let blank = cells - bars - label_len;
-    let color = if ratio >= 0.9 {
-        colors.danger
-    } else if ratio >= 0.7 {
-        colors.warning
-    } else {
-        colors.success
-    };
-    let percent = if value.is_some() { mono(percent) } else { tinted(percent, colors.dim) };
     widget::Row::new()
-        .push(tinted("[", colors.dim))
-        .push(tinted("|".repeat(bars), color).wrapping(Wrapping::None))
-        .push(mono(" ".repeat(blank)).wrapping(Wrapping::None))
-        .push(percent.wrapping(Wrapping::None))
-        .push(tinted("]", colors.dim))
+        .push(tinted("━".repeat(filled), meter_color(ratio)).wrapping(Wrapping::None))
+        .push(tinted("━".repeat(cells - filled), palette.selection).wrapping(Wrapping::None))
         .into()
 }
 
@@ -2246,7 +2651,8 @@ fn composer_key(
 }
 
 /// Espera o `claude` do chat fechado sair (ao receber o SIGHUP, ele grava a sessão) e abre
-/// a sessão no COSMIC Terminal, na pasta do chat.
+/// a sessão no terminal do Omarchy, numa janela de agente (`org.omarchy.agent`, como as do
+/// `omarchy agent`), na pasta do chat.
 async fn open_in_terminal(
     pid: Option<u32>,
     cwd: PathBuf,
@@ -2260,15 +2666,17 @@ async fn open_in_terminal(
             waited += step;
         }
     }
-    let mut child = tokio::process::Command::new("cosmic-term")
-        .arg("--working-directory")
+    // O `omarchy-launch-tui` passa pelo `uwsm-app`, que não leva a pasta atual: o `sh` entra nela.
+    let mut child = tokio::process::Command::new("omarchy-launch-tui")
+        .arg("--app-id=org.omarchy.agent")
+        .args(["sh", "-c", "cd \"$0\" && exec \"$@\""])
         .arg(&cwd)
-        .arg("-e")
         .arg(program)
         .args(args)
+        .current_dir(&cwd)
         .spawn()
         .map_err(|error| error.to_string())?;
-    // O cosmic-term se separa e sai logo; o `wait` evita deixar um processo zumbi.
+    // O lançador se separa e sai logo; o `wait` evita deixar um processo zumbi.
     tokio::spawn(async move {
         let _ = child.wait().await;
     });

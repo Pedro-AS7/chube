@@ -19,12 +19,20 @@ pub enum Start {
 ///
 /// Passa pelo `env -u ANTHROPIC_API_KEY`: com a API key definida, o Claude Code cobraria
 /// pela API em vez de usar o plano. O `env` faz `exec`, então o pid do PTY é o do `claude`.
-pub fn command(start: &Start, model: Option<&str>, prompt: Option<&str>) -> (String, Vec<String>) {
-    let mut args: Vec<String> = vec![
+pub fn command(start: &Start, model: Option<&str>, prompt: Option<&str>, auto: bool) -> (String, Vec<String>) {
+    let mut command: Vec<String> = vec![
         "-u".into(),
         "ANTHROPIC_API_KEY".into(),
         claude_bin().display().to_string(),
     ];
+    command.extend(args(start, model, prompt, auto));
+    ("env".into(), command)
+}
+
+/// Argumentos do `claude`, sem o binário (os mesmos aqui e na VPS). `auto` é o modo do
+/// `omarchy agent`: `--permission-mode auto`.
+pub fn args(start: &Start, model: Option<&str>, prompt: Option<&str>, auto: bool) -> Vec<String> {
+    let mut args = Vec::new();
     match start {
         Start::New { session_id } => args.extend(["--session-id".into(), session_id.clone()]),
         Start::Resume { session_id } => args.extend(["--resume".into(), session_id.clone()]),
@@ -34,6 +42,9 @@ pub fn command(start: &Start, model: Option<&str>, prompt: Option<&str>) -> (Str
             "--fork-session".into(),
         ]),
     }
+    if auto {
+        args.extend(["--permission-mode".into(), "auto".into()]);
+    }
     if let Some(model) = model {
         args.extend(["--model".into(), model.to_owned()]);
     }
@@ -41,7 +52,7 @@ pub fn command(start: &Start, model: Option<&str>, prompt: Option<&str>) -> (Str
         // `--` para um prompt que comece com `-` não virar opção.
         args.extend(["--".into(), prompt.to_owned()]);
     }
-    ("env".into(), args)
+    args
 }
 
 /// Procura o `claude` no PATH e, se não achar (apps abertos pelo launcher podem não ter
@@ -75,6 +86,19 @@ pub fn title_from_terminal(title: &str) -> Option<String> {
         .trim_start_matches(|c: char| !c.is_alphanumeric() && !c.is_ascii_punctuation())
         .trim();
     (!title.is_empty() && title != "Claude Code").then(|| title.to_owned())
+}
+
+/// Status pelo título do terminal, para as sessões da VPS (onde não há o
+/// `~/.claude/sessions/<pid>.json` para ler): `✳` parado, outro símbolo (o spinner) trabalhando.
+pub fn status_from_title(title: &str) -> Option<crate::chat::Status> {
+    let first = title.trim_start().chars().next()?;
+    if first == '✳' {
+        Some(crate::chat::Status::Ready)
+    } else if !first.is_alphanumeric() && !first.is_ascii() {
+        Some(crate::chat::Status::Working)
+    } else {
+        None
+    }
 }
 
 /// Modo de permissão do Claude Code, trocado com Shift+Tab na TUI.
@@ -161,12 +185,22 @@ mod tests {
         let start = Start::Fork {
             parent_session_id: "abc".into(),
         };
-        let (program, args) = command(&start, Some("haiku"), Some("-oi"));
+        let (program, args) = command(&start, Some("haiku"), Some("-oi"), false);
         assert_eq!(program, "env");
         assert_eq!(&args[..2], ["-u", "ANTHROPIC_API_KEY"]);
         assert_eq!(
             &args[3..],
             ["--resume", "abc", "--fork-session", "--model", "haiku", "--", "-oi"]
         );
+        let auto = self::args(&Start::New { session_id: "x".into() }, None, None, true);
+        assert_eq!(auto, ["--session-id", "x", "--permission-mode", "auto"]);
+    }
+
+    #[test]
+    fn status_pelo_titulo() {
+        use crate::chat::Status;
+        assert_eq!(status_from_title("✳ Corrigir testes"), Some(Status::Ready));
+        assert_eq!(status_from_title("⠂ Corrigir testes"), Some(Status::Working));
+        assert_eq!(status_from_title("bash"), None);
     }
 }
