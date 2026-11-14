@@ -300,6 +300,12 @@ O pid vem do callback do `spawn_async` (`Chat::pid`, numa `Rc<Cell>`). O texto d
 
 ## Visual (tema do Omarchy, desde 2026-11-13)
 
+- **Temas (2026-11-14)**: seletor no botão de paleta do cabeçalho "# chats". Temas próprios em `palettes.rs`, opacos, para
+  qualquer distro: Tokyo Night (padrão fora do Omarchy), Catppuccin Mocha e Latte, Gruvbox e Nord, com as cores oficiais
+  (só o "apagado" do Tokyo Night, do Nord e do Latte é um tom mais forte, para ler; `palettes::tests` confere o contraste
+  WCAG). "seguir o Omarchy" só aparece onde há `~/.local/state/omarchy/current/theme/colors.toml` e é o padrão lá. A escolha
+  vai para `$XDG_CONFIG_HOME/chube/config.json` (`config.rs`); uma escolha que não existe nesta máquina volta ao padrão
+  (`themes::resolve`). Com tema próprio, a conferência do tema do Omarchy não roda.
 - **Cores** do tema atual do Omarchy (`~/.local/state/omarchy/current/theme/colors.toml`, `omarchy.rs`): fundo, texto,
   `muted` (apagado), acento, seleção e as ANSI (verde = "pronto", amarelo = aviso, vermelho = erro). No Starship do usuário o
   acento é `#7aa2f7` (overlay em `~/.config/omarchy/themes/starship/`) e o "verde" é laranja.

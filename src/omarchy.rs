@@ -26,6 +26,11 @@ fn theme_dir() -> PathBuf {
     state_dir().join("current/theme")
 }
 
+/// O Omarchy está nesta máquina (tem um tema aplicado). Fora dele, o C-hub usa os temas próprios.
+pub fn installed() -> bool {
+    theme_dir().join("colors.toml").is_file()
+}
+
 /// Cor `#rrggbb` em `0xRRGGBB`.
 pub type Rgb = u32;
 

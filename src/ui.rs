@@ -34,6 +34,7 @@ pub const ICON_OMARCHY: &str = "\u{f303}";
 const ICON_HISTORY: &str = "\u{f02da}";
 const ICON_FORK: &str = "\u{e725}";
 const ICON_STOP: &str = "\u{f04d}";
+const ICON_THEME: &str = "\u{f03d8}";
 const ICON_USAGE: &str = "\u{f080}";
 const ICON_REFRESH: &str = "\u{f0450}";
 const ICON_CHATS: &str = "\u{f0b79}";
@@ -73,6 +74,8 @@ pub struct Ui {
     kill_remote: gtk4::Button,
     mode: gtk4::MenuButton,
     mode_items: Vec<gtk4::Button>,
+    /// Itens do menu de temas, com o id de cada um.
+    theme_items: Vec<(&'static str, gtk4::Button)>,
     close_panel: gtk4::Button,
     usage_body: gtk4::Box,
     usage_key: RefCell<Vec<String>>,
@@ -109,7 +112,8 @@ impl Ui {
         });
         let help = label(ICON_HELP, &["dim", "icon-label"]);
         help.set_tooltip_text(Some(&shortcuts_help()));
-        let header = row!(&heading(ICON_CHATS, "chats"), &chats_count, &fill(), &new_chat, &show_sessions, &help, &hide_sidebar);
+        let (theme, theme_items) = theme_selector(&tx);
+        let header = row!(&heading(ICON_CHATS, "chats"), &chats_count, &fill(), &new_chat, &show_sessions, &theme, &help, &hide_sidebar);
         let list = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
         let scroll = gtk4::ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -260,6 +264,7 @@ impl Ui {
             kill_remote,
             mode,
             mode_items,
+            theme_items,
             close_panel,
             usage_body,
             usage_key: RefCell::new(vec!["(nunca)".into()]),
@@ -304,6 +309,10 @@ impl Ui {
         self.show_terminal.set_visible(!app.terminal_visible);
         self.show_chat.set_visible(!app.chat_visible);
 
+        let theme = themes::choice();
+        for (id, item) in &self.theme_items {
+            set_selected(item, *id == theme);
+        }
         self.sync_list(app);
         self.sync_chat(app);
         self.sync_usage(app);
@@ -715,6 +724,43 @@ impl Meter {
             meter.append(&label(&format!("└ {note}"), &["dim"]));
         }
         meter
+    }
+}
+
+/// Botão de paleta com o menu dos temas: os próprios e, onde houver Omarchy, "seguir o Omarchy".
+fn theme_selector(tx: &Sender<Message>) -> (gtk4::MenuButton, Vec<(&'static str, gtk4::Button)>) {
+    let menu = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    let popover = gtk4::Popover::new();
+    popover.set_has_arrow(false);
+    popover.add_css_class("menu-card");
+    let mut items = Vec::new();
+    for (id, name) in themes::available() {
+        let item = gtk4::Button::new();
+        item.set_child(Some(&label(name, &[])));
+        item.add_css_class("choice");
+        let sender = tx.clone();
+        let parent = popover.clone();
+        item.connect_clicked(move |_| {
+            parent.popdown();
+            let _ = sender.try_send(Message::SetTheme(id.to_owned()));
+        });
+        menu.append(&item);
+        items.push((id, item));
+    }
+    popover.set_child(Some(&menu));
+    // Com `label`, o GTK põe uma seta ao lado; como filho, fica só o ícone, como os outros botões.
+    let button = gtk4::MenuButton::builder().popover(&popover).child(&gtk4::Label::new(Some(ICON_THEME))).build();
+    button.add_css_class("mode");
+    button.add_css_class("dim");
+    button.set_tooltip_text(Some("Tema"));
+    (button, items)
+}
+
+fn set_selected(widget: &impl IsA<gtk4::Widget>, selected: bool) {
+    if selected {
+        widget.add_css_class("selected");
+    } else {
+        widget.remove_css_class("selected");
     }
 }
 

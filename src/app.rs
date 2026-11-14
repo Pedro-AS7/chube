@@ -123,6 +123,8 @@ pub enum Message {
     Shortcut(Shortcut),
     HideSection(Section),
     ShowSection(Section),
+    /// Troca o tema (id de `themes::available`) e grava a escolha.
+    SetTheme(String),
     /// Confere se o tema do Omarchy mudou.
     CheckTheme,
     ThemeChecked(String),
@@ -530,6 +532,15 @@ impl App {
                 Section::Chat => self.chat_visible = true,
                 Section::Terminal => self.terminal_visible = true,
             },
+            Message::SetTheme(id) => {
+                if let Err(error) = crate::config::set_theme(&id) {
+                    self.notice = Some(format!("não consegui gravar o tema: {error}"));
+                }
+                themes::set_choice(&id);
+                self.apply_theme();
+            }
+            // Com um tema próprio, o do Omarchy não importa.
+            Message::CheckTheme if themes::choice() != themes::OMARCHY => {}
             Message::CheckTheme => {
                 if !self.checking_theme {
                     self.checking_theme = true;
@@ -540,7 +551,7 @@ impl App {
                 self.checking_theme = false;
                 if fingerprint != self.theme_fingerprint {
                     self.theme_fingerprint = fingerprint;
-                    self.apply_omarchy_theme();
+                    self.apply_theme();
                 }
             }
             Message::TaskFailed(error) => log::error!("tarefa falhou: {error}"),
@@ -1187,8 +1198,8 @@ impl App {
         }
     }
 
-    /// Relê o tema do Omarchy e o aplica nos terminais abertos; o CSS fica com a interface.
-    fn apply_omarchy_theme(&mut self) {
+    /// Relê o tema e o aplica nos terminais abertos; o CSS fica com a interface.
+    fn apply_theme(&mut self) {
         themes::reload();
         let chats = self.chats.iter().filter_map(|chat| chat.terminal.as_ref());
         for terminal in chats.chain(self.tabs.iter().map(|tab| &tab.terminal)) {

@@ -1,12 +1,14 @@
 mod agent;
 mod cli;
 mod codex;
+mod config;
 mod app;
 mod chat;
 mod claude;
 mod dirs;
 mod groups;
 mod omarchy;
+mod palettes;
 mod panels;
 mod remote;
 mod restore;

@@ -1,4 +1,5 @@
-//! Cores do Chube: as do tema atual do Omarchy (`omarchy.rs`), relidas quando o tema muda.
+//! Cores do Chube: as do tema atual do Omarchy (`omarchy.rs`, com o vidro, relidas quando o tema
+//! muda) ou as de um tema próprio (`palettes.rs`, opacos, para qualquer distro).
 //!
 //! A paleta fica num `static` para ser lida de qualquer parte da interface (CSS e terminais).
 //! Os tokens seguem o `shell.toml` do Omarchy (menus, controles e popups do shell): linhas
@@ -78,6 +79,60 @@ impl Palette {
 }
 
 static CURRENT: RwLock<Option<Arc<Palette>>> = RwLock::new(None);
+/// Tema escolhido: `OMARCHY` ou o id de um tema próprio.
+static CHOICE: RwLock<Option<String>> = RwLock::new(None);
+
+/// Seguir o tema do Omarchy (só oferecido onde ele existe).
+pub const OMARCHY: &str = "omarchy";
+
+/// Temas que o seletor oferece: (id, nome).
+pub fn available() -> Vec<(&'static str, &'static str)> {
+    let mut list = Vec::new();
+    if crate::omarchy::installed() {
+        list.push((OMARCHY, "seguir o Omarchy"));
+    }
+    list.extend(crate::palettes::BUILTINS.iter().map(|builtin| (builtin.id, builtin.name)));
+    list
+}
+
+/// Tema em uso: o gravado, se ainda existir aqui; senão o do Omarchy, onde houver, ou o padrão.
+pub fn choice() -> String {
+    if let Some(choice) = CHOICE.read().ok().and_then(|choice| choice.clone()) {
+        return choice;
+    }
+    let choice = resolve(crate::config::theme().as_deref(), crate::omarchy::installed());
+    if let Ok(mut current) = CHOICE.write() {
+        *current = Some(choice.clone());
+    }
+    choice
+}
+
+/// Troca o tema (o chamador grava a escolha e relê a paleta).
+pub fn set_choice(id: &str) {
+    if let Ok(mut current) = CHOICE.write() {
+        *current = Some(id.to_owned());
+    }
+}
+
+/// Escolha válida a partir da gravada: um tema que não existe mais, ou "seguir o Omarchy" numa
+/// máquina sem ele, volta ao padrão.
+fn resolve(saved: Option<&str>, omarchy: bool) -> String {
+    match saved {
+        Some(OMARCHY) if omarchy => OMARCHY.to_owned(),
+        Some(id) if crate::palettes::find(id).is_some() => id.to_owned(),
+        _ if omarchy => OMARCHY.to_owned(),
+        _ => crate::palettes::DEFAULT.to_owned(),
+    }
+}
+
+/// Cores do tema escolhido.
+fn colors() -> ThemeColors {
+    let choice = choice();
+    match crate::palettes::find(&choice) {
+        Some(builtin) => builtin.colors.clone(),
+        None => ThemeColors::load(),
+    }
+}
 
 /// Paleta em uso; lê o tema do Omarchy na primeira chamada.
 pub fn current() -> Arc<Palette> {
@@ -87,9 +142,9 @@ pub fn current() -> Arc<Palette> {
     reload()
 }
 
-/// Relê o tema do Omarchy (depois de um `omarchy theme set` ou do modo vidro).
+/// Relê o tema (depois de um `omarchy theme set`, do modo vidro ou de uma troca no seletor).
 pub fn reload() -> Arc<Palette> {
-    let palette = Arc::new(Palette::new(ThemeColors::load(), crate::omarchy::terminal_font_px()));
+    let palette = Arc::new(Palette::new(colors(), crate::omarchy::terminal_font_px()));
     if let Ok(mut current) = CURRENT.write() {
         *current = Some(palette.clone());
     }
@@ -103,6 +158,17 @@ pub const fn rgb(hex: Rgb) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escolha_valida() {
+        assert_eq!(resolve(None, true), OMARCHY);
+        assert_eq!(resolve(None, false), crate::palettes::DEFAULT);
+        assert_eq!(resolve(Some("nord"), true), "nord");
+        // Configuração copiada de uma máquina com Omarchy para uma sem ele.
+        assert_eq!(resolve(Some(OMARCHY), false), crate::palettes::DEFAULT);
+        assert_eq!(resolve(Some("tema-removido"), false), crate::palettes::DEFAULT);
+        assert_eq!(resolve(Some("tema-removido"), true), OMARCHY);
+    }
 
     #[test]
     fn paleta_segue_o_tema() {
