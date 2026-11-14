@@ -167,7 +167,9 @@ env -u ANTHROPIC_API_KEY claude (--session-id <uuid> | --resume <id> | --resume 
   não chegam ao PTY. Só Ctrl e Shift contam (Caps Lock e Num Lock ficam de fora).
 - Os números valem pela tecla física (código do GDK, evdev + 8), independentemente do layout.
 - Ctrl+Tab: se o terminal do chat tem o foco, vai para a aba ativa; senão, para o chat (`Ui::switch_focus`).
-- A lista aparece na dica do `[?]` no cabeçalho "# chats"; as dicas dos botões mostram a tecla.
+- A lista abre ao clicar no `?` do cabeçalho "# chats" (um `MenuButton`); as dicas dos botões mostram a tecla.
+- Esc fecha o painel aberto (nova sessão, sessões). É tratado no mesmo controlador da janela, porque aberto por um botão
+  o foco fica no botão ou no terminal do chat escondido atrás do painel; com o foco no terminal integrado, o Esc vai ao shell.
 
 ### Status, título e contexto
 - A cada 1 s (`Message::Poll`, em `spawn_blocking`), para cada chat vivo: `~/.claude/sessions/<pid>.json` →

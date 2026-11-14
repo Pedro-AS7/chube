@@ -128,7 +128,6 @@ impl NewChatPanel {
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .child(&form)
             .build();
-        close_on_escape(&root, tx);
         Self { root, launches, places, entry, preview, shortcuts, remote_note, create, browse }
     }
 
@@ -209,7 +208,6 @@ impl SessionsPanel {
         root.add_css_class("panel");
         root.append(&header);
         root.append(&scroll);
-        close_on_escape(&root, tx);
         Self { root, places, list, version: Cell::new(u64::MAX) }
     }
 
@@ -393,18 +391,4 @@ fn set_selected(button: &gtk4::Button, selected: bool) {
     } else {
         button.remove_css_class("selected");
     }
-}
-
-/// Esc volta ao chat (com o foco em qualquer widget do painel).
-fn close_on_escape(widget: &impl IsA<gtk4::Widget>, tx: &Sender<Message>) {
-    let keys = gtk4::EventControllerKey::new();
-    let sender = tx.clone();
-    keys.connect_key_pressed(move |_, keyval, _, _| {
-        if keyval == gtk4::gdk::Key::Escape {
-            let _ = sender.try_send(Message::ClosePanel);
-            return gtk4::glib::Propagation::Stop;
-        }
-        gtk4::glib::Propagation::Proceed
-    });
-    widget.add_controller(keys);
 }

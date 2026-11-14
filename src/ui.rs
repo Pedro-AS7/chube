@@ -5,7 +5,8 @@
 //! aparece. A lista e as abas só são refeitas quando o que elas mostram muda, e o GTK só redesenha
 //! o que mudou (o hover de uma linha não redesenha os terminais).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::collections::HashSet;
 
 use async_channel::Sender;
@@ -54,6 +55,8 @@ macro_rules! row {
 pub(crate) use row;
 
 pub struct Ui {
+    /// Há um painel no lugar do chat (lido pelo Esc da janela).
+    panel_open: Rc<Cell<bool>>,
     window: gtk4::ApplicationWindow,
     css: gtk4::CssProvider,
     tx: Sender<Message>,
@@ -110,8 +113,7 @@ impl Ui {
         let hide_sidebar = icon_button(ICON_HIDE_LEFT, "Esconder o painel (Ctrl+Shift+1)", &tx, || {
             Message::HideSection(Section::Sidebar)
         });
-        let help = label(ICON_HELP, &["dim", "icon-label"]);
-        help.set_tooltip_text(Some(&shortcuts_help()));
+        let help = shortcuts_menu();
         let (theme, theme_items) = theme_selector(&tx);
         let header = row!(&heading(ICON_CHATS, "chats"), &chats_count, &fill(), &new_chat, &show_sessions, &theme, &help, &hide_sidebar);
         let list = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
@@ -235,16 +237,34 @@ impl Ui {
         let keys = gtk4::EventControllerKey::new();
         keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let sender = tx.clone();
-        keys.connect_key_pressed(move |_, keyval, keycode, state| match shortcuts::find(keyval, keycode, state) {
-            Some(shortcut) => {
+        let panel_open = Rc::new(Cell::new(false));
+        let open = panel_open.clone();
+        let terminal_side = terminal_card.clone();
+        keys.connect_key_pressed(move |controller, keyval, keycode, state| {
+            if let Some(shortcut) = shortcuts::find(keyval, keycode, state) {
                 let _ = sender.try_send(Message::Shortcut(shortcut));
-                glib::Propagation::Stop
+                return glib::Propagation::Stop;
             }
-            None => glib::Propagation::Proceed,
+            // Esc fecha o painel aberto. Ouvir só no painel não basta: aberto por um botão, o foco
+            // fica no botão ou no terminal do chat escondido atrás dele. No terminal integrado da
+            // direita, o Esc continua indo para o shell.
+            if keyval == gdk::Key::Escape && open.get() {
+                let in_terminal = controller
+                    .widget()
+                    .and_then(|window| window.root())
+                    .and_then(|root| root.focus())
+                    .is_some_and(|focus| focus.is_ancestor(&terminal_side));
+                if !in_terminal {
+                    let _ = sender.try_send(Message::ClosePanel);
+                    return glib::Propagation::Stop;
+                }
+            }
+            glib::Propagation::Proceed
         });
         window.add_controller(keys);
 
         let ui = Ui {
+            panel_open,
             window,
             css,
             tx,
@@ -297,6 +317,7 @@ impl Ui {
 
     /// Deixa a interface igual ao estado do app.
     pub fn sync(&self, app: &mut App) {
+        self.panel_open.set(app.panel != Panel::None);
         if std::mem::take(&mut app.theme_changed) {
             self.css.load_from_string(&stylesheet());
             // As cores dos glifos de status estão nas classes; refaz a lista com o tema novo.
@@ -840,12 +861,24 @@ pub fn status_glyph(status: Status) -> (&'static str, &'static str) {
     }
 }
 
-fn shortcuts_help() -> String {
-    shortcuts::LIST
-        .iter()
-        .map(|(keys, shortcut)| format!("{keys:<14}{}", shortcut.label()))
-        .collect::<Vec<_>>()
-        .join("\n")
+/// `?` com a lista dos atalhos de teclado, aberta ao clicar.
+fn shortcuts_menu() -> gtk4::MenuButton {
+    let list = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    for (keys, shortcut) in shortcuts::LIST {
+        let key = label(keys, &["accent"]);
+        key.set_width_chars(14);
+        list.append(&row!(&key, &label(shortcut.label(), &[])));
+    }
+    list.append(&label("Esc fecha o painel aberto (nova sessão, sessões)", &["dim"]));
+    let popover = gtk4::Popover::new();
+    popover.set_has_arrow(false);
+    popover.add_css_class("menu-card");
+    popover.set_child(Some(&list));
+    let button = gtk4::MenuButton::builder().popover(&popover).child(&gtk4::Label::new(Some(ICON_HELP))).build();
+    button.add_css_class("mode");
+    button.add_css_class("dim");
+    button.set_tooltip_text(Some("Atalhos de teclado"));
+    button
 }
 
 pub fn label(text: &str, classes: &[&str]) -> gtk4::Label {
