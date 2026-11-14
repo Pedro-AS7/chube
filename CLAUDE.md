@@ -34,7 +34,7 @@ Projeto em português (Brasil). Comentários e UI em PT-BR; identificadores de c
   (`res/com.pedro.Chube.svg` → `~/.local/share/icons/hicolor/scalable/apps/`) e `.desktop` (`res/com.pedro.Chube.desktop`
   → `~/.local/share/applications/com.pedro.Chube.desktop`, com o caminho absoluto do binário). Rodar de novo atualiza;
   `./install.sh --uninstall` remove. O nome do `.desktop` é o `APP_ID` da janela, que é como o dock liga os dois.
-- `cargo test` — testes do leitor do `/usage` e do `/context` (`src/usage.rs`), de `process_running` e `short_tokens` (`src/app.rs`), dos atalhos (`src/shortcuts.rs`), da lista de chats gravada (`src/restore.rs`), da paleta (`src/themes.rs`),
+- `cargo test` — testes do leitor do `/usage` e do `/context` (`src/usage.rs`), de `process_running` e `short_tokens` (`src/app.rs`), dos atalhos (`src/shortcuts.rs`), do agrupamento da lista de chats (`src/groups.rs`), da lista de chats gravada (`src/restore.rs`), da paleta (`src/themes.rs`),
   do tema, da fonte, dos limites e da conta do Omarchy (`src/omarchy.rs`), dos hosts, das aspas, do comando do tmux e da lista da VPS (`src/remote.rs`),
   dos chats da VPS e do tmux de fora (`src/chat.rs`), do comando, do título, do status pelo título e do modo em `src/claude.rs`,
   das sugestões de `/comandos` (`src/commands.rs`), do fundo das mensagens do `claude` (`src/term/terminal.rs`) e os que vieram do cosmic-term em `src/term/terminal_box.rs`.
@@ -67,6 +67,8 @@ src/
   sessions.rs   Sessões salvas (~/.claude/projects), status de um `claude` pelo pid (~/.claude/sessions)
                 e contexto/modelo pelo fim do .jsonl
   dirs.rs       Resolve o diretório digitado: ".", "~", caminhos, atalhos do fshort (~/.shortcuts)
+  groups.rs     Agrupa a lista de chats: categoria (agente omarchy > local > vps)
+                e, dentro dela, pasta; os atalhos de chat de cima/de baixo seguem essa ordem
   usage.rs      Limites do plano via `/usage`
   restore.rs    Lista de chats abertos, gravada a cada mudança e reaberta ao iniciar
   themes.rs     Paleta do tema do Omarchy (num static, relida quando o tema muda) e o CosmicTheme dela
@@ -192,6 +194,9 @@ env -u ANTHROPIC_API_KEY claude (--session-id <uuid> | --resume <id> | --resume 
   nunca `auth.json`. Lê os últimos 512 KiB para modelo, contexto, tamanho da janela, limites e início/fim de tarefas.
   Os limites são os últimos registrados nessa conversa; não são uma consulta ao vivo da conta. `/status` na CLI
   mostra os dados dela. Pedidos de aprovação do Codex não têm detecção separada de status no Chube.
+- O modo do Omarchy (`auto`) só existe nesta máquina: o agente do Omarchy é do sistema do notebook. No painel de nova
+  sessão, escolher "omarchy" volta o lugar para local e esconde os hosts; escolher um host troca o agente pelo que o
+  Omarchy usaria. `Chat::with_place` e `Chat::restore` descartam `auto` num chat da VPS (inclusive gravado antes da regra).
 - `restore::OpenChat` grava `agent`, `auto` (modo do Omarchy), `host` e `tmux` (VPS); arquivos antigos sem os campos continuam
   sendo chats locais do Claude, sem o modo. Identificadores desconhecidos
   de agente são ignorados. Chats novos sem histórico são gravados como rascunhos (`draft:<id>`) e voltam como chats

@@ -20,6 +20,7 @@ use crate::chat::{Chat, ModeChange, Status, TMUX_ID_PREFIX};
 use crate::claude::{self, Mode, Start};
 use crate::commands::{self, Command};
 use crate::dirs;
+use crate::groups::{self, Category, CategoryGroup};
 use crate::omarchy;
 use crate::remote::{self, Listing, RemoteStatus};
 use crate::restore::{self, OpenChat, OpenChats};
@@ -461,7 +462,7 @@ impl App {
             Message::NewChat => {
                 // Herda o agente e o lugar do chat em foco; sem chat, o padrão da linha de comando.
                 let (launch, host) = match self.chats.get(self.focused) {
-                    Some(chat) if chat.auto => (Launch::Omarchy, chat.host.clone()),
+                    Some(chat) if chat.auto => (Launch::Omarchy, None),
                     Some(chat) => (launch_of(chat.agent), chat.host.clone()),
                     None if self.default_auto => (Launch::Omarchy, None),
                     // Sem chat, o agente do Omarchy, se ele for um dos que o Chube abre.
@@ -475,8 +476,18 @@ impl App {
                 return widget::text_input::focus(self.new_chat_input_id.clone());
             }
             Message::NewChatInput(text) => self.new_chat_input = text,
-            Message::NewChatLaunch(launch) => self.new_chat_launch = launch,
+            Message::NewChatLaunch(launch) => {
+                // O agente do Omarchy só roda neste notebook.
+                if launch == Launch::Omarchy {
+                    self.new_chat_host = None;
+                }
+                self.new_chat_launch = launch;
+            }
             Message::NewChatHost(host) => {
+                // Na VPS não há o agente do Omarchy: troca pelo agente que ele usaria.
+                if host.is_some() && self.new_chat_launch == Launch::Omarchy {
+                    self.new_chat_launch = launch_of(self.omarchy_agent.unwrap_or(self.default_agent));
+                }
                 self.new_chat_host = host;
                 return widget::text_input::focus(self.new_chat_input_id.clone());
             }
@@ -1263,10 +1274,13 @@ impl App {
             }
             Shortcut::PreviousChat | Shortcut::NextChat if !self.chats.is_empty() => {
                 // Dá a volta nas pontas, como as abas do tmux.
-                let len = self.chats.len();
+                // Segue a ordem da lista agrupada, não a de abertura.
+                let order = groups::display_order(&self.chat_groups());
+                let len = order.len();
+                let position = order.iter().position(|&index| index == self.focused).unwrap_or(0);
                 let index = match shortcut {
-                    Shortcut::PreviousChat => (self.focused + len - 1) % len,
-                    _ => (self.focused + 1) % len,
+                    Shortcut::PreviousChat => order[(position + len - 1) % len],
+                    _ => order[(position + 1) % len],
                 };
                 self.update(Message::SelectChat(index))
             }
@@ -1572,49 +1586,92 @@ impl App {
         }
     }
 
+    /// Chats agrupados como na lista: categoria (omarchy, local, vps) e, dentro dela, pasta.
+    fn chat_groups(&self) -> Vec<CategoryGroup> {
+        let keys: Vec<_> = self
+            .chats
+            .iter()
+            .map(|chat| (Category::of(chat.auto, chat.host.is_some()), chat.place_label()))
+            .collect();
+        groups::group(&keys)
+    }
+
+    /// Um chat da lista: status e título; embaixo, o agente e o status por extenso
+    /// (a pasta e o lugar já estão nos cabeçalhos do grupo).
+    fn chat_row(&self, index: usize) -> Element<'_, Message> {
+        let space = theme::spacing();
+        let palette = themes::current();
+        let chat = &self.chats[index];
+        let selected = index == self.focused;
+        let (glyph, color) = status_glyph(chat.status);
+        let title = if selected {
+            bold(chat.title.as_str()).class(theme::Text::Color(palette.accent))
+        } else {
+            mono(chat.title.as_str())
+        };
+        let close_tip = if chat.host.is_some() {
+            "Desconectar (o agente continua na VPS)"
+        } else {
+            "Fechar este chat (como /exit)"
+        };
+        let first = widget::Row::new()
+            .push(tinted(format!("{glyph} "), color))
+            // Cortado no container: sem ele, o texto sem quebra passa por baixo do botão.
+            .push(widget::container(title.wrapping(Wrapping::None)).width(Length::Fill).clip(true))
+            .push(icon_button(ICON_CLOSE, close_tip, Some(Message::CloseChat(index))))
+            .align_y(Alignment::Center);
+        // Trabalhando / precisa de você ficam na cor do status; os outros, apagados.
+        let status_color = match chat.status {
+            Status::Working | Status::Waiting => color,
+            _ => palette.dim,
+        };
+        // No grupo do Omarchy, o "omarchy · " do rótulo seria repetido.
+        let agent = if chat.auto && !chat.attach_only { chat.agent.key().to_owned() } else { chat.agent_label() };
+        let second = widget::Row::new()
+            .push(tinted(format!("  {agent} · "), palette.dim).wrapping(Wrapping::None))
+            .push(tinted(chat.status.label(), status_color).wrapping(Wrapping::None));
+        let item = widget::container(widget::Column::new().push(first).push(second))
+            .width(Length::Fill)
+            .clip(true);
+        row_button(item, selected)
+            .padding([space.space_xxxs, space.space_xxs])
+            .width(Length::Fill)
+            .on_press(Message::SelectChat(index))
+            .into()
+    }
+
     fn chats_card(&self) -> Element<'_, Message> {
         let space = theme::spacing();
         let palette = themes::current();
 
         let mut list = widget::Column::new().spacing(space.space_xxxs);
-        for (index, chat) in self.chats.iter().enumerate() {
-            let selected = index == self.focused;
-            let (glyph, color) = status_glyph(chat.status);
-            let title = if selected {
-                bold(chat.title.as_str()).class(theme::Text::Color(palette.accent))
-            } else {
-                mono(chat.title.as_str())
+        for group in self.chat_groups() {
+            let icon = match group.category {
+                Category::Omarchy => ICON_OMARCHY,
+                Category::Local => ICON_LAPTOP,
+                Category::Vps => ICON_SERVER,
             };
-            let close_tip = if chat.host.is_some() {
-                "Desconectar (o agente continua na VPS)"
-            } else {
-                "Fechar este chat (como /exit)"
-            };
-            let first = widget::Row::new()
-                .push(tinted(format!("{glyph} "), color))
-                // Cortado no container: sem ele, o texto sem quebra passa por baixo do botão.
-                .push(widget::container(title.wrapping(Wrapping::None)).width(Length::Fill).clip(true))
-                .push(icon_button(ICON_CLOSE, close_tip, Some(Message::CloseChat(index))))
-                .align_y(Alignment::Center);
-            // Trabalhando / precisa de você ficam na cor do status; os outros, apagados.
-            let status_color = match chat.status {
-                Status::Working | Status::Waiting => color,
-                _ => palette.dim,
-            };
-            let mut second = widget::Row::new().push(
-                tinted(format!("  {} · {} · ", chat.agent_label(), chat.place_label()), palette.dim)
-                    .wrapping(Wrapping::None),
-            );
-            second = second.push(tinted(chat.status.label(), status_color).wrapping(Wrapping::None));
-            let item = widget::container(widget::Column::new().push(first).push(second))
-                .width(Length::Fill)
-                .clip(true);
+            let count: usize = group.dirs.iter().map(|dir| dir.chats.len()).sum();
             list = list.push(
-                row_button(item, selected)
-                    .padding([space.space_xxxs, space.space_xxs])
-                    .width(Length::Fill)
-                    .on_press(Message::SelectChat(index)),
+                widget::Row::new()
+                    .push(heading(icon, group.category.label()))
+                    .push(tinted(format!(" {count}"), palette.dim))
+                    .padding([space.space_xxxs, 0, 0, 0]),
             );
+            for dir in group.dirs {
+                list = list.push(
+                    widget::container(tinted(format!("  {}", dir.dir), palette.dim).wrapping(Wrapping::None))
+                        .width(Length::Fill)
+                        .clip(true),
+                );
+                for index in dir.chats {
+                    list = list.push(
+                        widget::container(self.chat_row(index))
+                            .padding([0, 0, 0, space.space_s])
+                            .width(Length::Fill),
+                    );
+                }
+            }
         }
         if self.chats.is_empty() {
             list = list.push(tinted("nenhum chat aberto", palette.dim));
@@ -2003,12 +2060,13 @@ impl App {
             choice("codex".into(), self.new_chat_launch == Launch::Codex, Message::NewChatLaunch(Launch::Codex)),
         ]);
 
+        // Com o agente do Omarchy, só "local": ele é do sistema deste notebook.
         let mut place_items = vec![choice(
             format!("{ICON_LAPTOP} local"),
             self.new_chat_host.is_none(),
             Message::NewChatHost(None),
         )];
-        for host in &self.hosts {
+        for host in self.hosts.iter().filter(|_| self.new_chat_launch != Launch::Omarchy) {
             let selected = self.new_chat_host.as_ref() == Some(host);
             place_items.push(choice(format!("{ICON_SERVER} {host}"), selected, Message::NewChatHost(Some(host.clone()))));
         }

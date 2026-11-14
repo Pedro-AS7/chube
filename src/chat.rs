@@ -156,7 +156,8 @@ impl Chat {
         } else {
             Self::new(id, open.agent, open.cwd.clone(), open.model.clone(), None)
         };
-        chat.auto = open.auto;
+        // O agente do Omarchy é deste notebook: um chat da VPS gravado com o modo dele volta sem.
+        chat.auto = open.auto && open.host.is_none();
         chat.host = open.host.clone();
         chat.tmux = open.tmux.clone();
         chat.attach_only = attach_only;
@@ -179,9 +180,10 @@ impl Chat {
         chat
     }
 
-    /// Com o modo do `omarchy agent` e/ou na VPS.
+    /// Com o modo do `omarchy agent` ou na VPS. Os dois juntos não existem: o agente do Omarchy
+    /// é do sistema deste notebook, então na VPS o modo é ignorado.
     pub fn with_place(mut self, auto: bool, host: Option<String>) -> Self {
-        self.auto = auto;
+        self.auto = auto && host.is_none();
         self.host = host;
         self
     }
@@ -391,6 +393,20 @@ mod tests {
     }
 
     #[test]
+    fn omarchy_mode_never_runs_on_the_vps() {
+        let new = Chat::new(1, Agent::Claude, "/tmp".into(), None, None).with_place(true, Some("vps-r1".into()));
+        assert!(!new.auto);
+        let local = Chat::new(2, Agent::Claude, "/tmp".into(), None, None).with_place(true, None);
+        assert!(local.auto);
+        let open = OpenChat {
+            agent: Agent::Claude, session_id: "sessao".into(), cwd: "/tmp".into(),
+            title: "Teste".into(), model: None, parent: None,
+            auto: true, host: Some("vps-r1".into()), tmux: Some("chube-1".into()),
+        };
+        assert!(!Chat::restore(3, &open, true).auto);
+    }
+
+    #[test]
     fn missing_codex_history_starts_a_new_codex_chat() {
         let open = OpenChat {
             agent: Agent::Codex, session_id: "draft:1".into(), cwd: "/tmp".into(),
@@ -410,13 +426,13 @@ mod tests {
     #[test]
     fn chat_da_vps_roda_no_tmux_e_volta_ao_mesmo() {
         let mut chat = Chat::new(1, Agent::Claude, "~/projeto".into(), None, Some("oi".into()))
-            .with_place(true, Some("vps-r1".into()));
+            .with_place(false, Some("vps-r1".into()));
         let (program, args) = chat.command();
         assert_eq!(program, "ssh");
         let tmux = chat.tmux.clone().unwrap();
         let script = args.last().unwrap();
         assert!(script.contains(&format!("-s {tmux} ")));
-        assert!(script.contains("--permission-mode auto"));
+        assert!(!script.contains("--permission-mode auto"));
         assert!(script.contains(" -- oi"));
         assert_eq!(chat.local_dir(), claude::home_dir());
         assert_eq!(chat.place_label(), "vps-r1:~/projeto");

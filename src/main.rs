@@ -6,6 +6,7 @@ mod chat;
 mod claude;
 mod commands;
 mod dirs;
+mod groups;
 mod omarchy;
 mod remote;
 mod restore;
