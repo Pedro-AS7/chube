@@ -358,9 +358,16 @@ impl Chat {
         }
     }
 
-    /// Pid do `claude` deste chat.
+    /// Pid do processo do terminal deste chat: no Claude, o filtro de cores (`filter.rs`), que
+    /// repassa o SIGHUP e só sai depois do `claude`.
     pub fn pid(&self) -> Option<u32> {
         self.pid.get()
+    }
+
+    /// Pid do agente em si (o do `~/.claude/sessions/<pid>.json`): no Claude, o filho do filtro.
+    pub fn agent_pid(&self) -> Option<u32> {
+        let pid = self.pid()?;
+        if self.agent == Agent::Claude { crate::filter::inner_pid(pid) } else { Some(pid) }
     }
 }
 

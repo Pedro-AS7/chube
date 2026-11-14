@@ -85,6 +85,29 @@ pub fn spawn(
     );
 }
 
+/// Cor padrão do xterm para as entradas 16 a 255: cubo 6×6×6 e 24 cinzas.
+fn xterm_color(index: u8) -> crate::omarchy::Rgb {
+    if index >= 232 {
+        let gray = 8 + 10 * u32::from(index - 232);
+        return gray << 16 | gray << 8 | gray;
+    }
+    let cube = u32::from(index - 16);
+    let level = |value: u32| if value == 0 { 0 } else { 55 + 40 * value };
+    level(cube / 36) << 16 | level(cube / 6 % 6) << 8 | level(cube % 6)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cores_do_xterm() {
+        assert_eq!(super::xterm_color(16), 0x000000);
+        assert_eq!(super::xterm_color(196), 0xff0000);
+        assert_eq!(super::xterm_color(231), 0xffffff);
+        assert_eq!(super::xterm_color(237), 0x3a3a3a);
+        assert_eq!(super::xterm_color(255), 0xeeeeee);
+    }
+}
+
 /// Fonte e cores do tema do Omarchy. O fundo fica transparente: quem pinta é a janela, com a
 /// opacidade do modo vidro.
 pub fn apply_theme(terminal: &vte4::Terminal) {
@@ -94,12 +117,17 @@ pub fn apply_theme(terminal: &vte4::Terminal) {
     font.set_absolute_size(f64::from(palette.font_px) * f64::from(pango::SCALE));
     terminal.set_font(Some(&font));
 
-    let ansi: Vec<gtk4::gdk::RGBA> = palette.colors.ansi.iter().map(|hex| themes::rgb(*hex).rgba()).collect();
-    let ansi: Vec<&gtk4::gdk::RGBA> = ansi.iter().collect();
+    // As 256 cores: as 16 do tema, o cubo e os cinzas do xterm, e as duas entradas da faixa das
+    // mensagens do `claude` (`filter.rs`) com a cor de seleção e o texto do tema.
+    let mut colors: Vec<gtk4::gdk::RGBA> = palette.colors.ansi.iter().map(|hex| themes::rgb(*hex).rgba()).collect();
+    colors.extend((16..=255).map(|index| themes::rgb(xterm_color(index)).rgba()));
+    colors[usize::from(crate::filter::MESSAGE_BG)] = palette.selection.rgba();
+    colors[usize::from(crate::filter::MESSAGE_FG)] = palette.text.rgba();
+    let colors: Vec<&gtk4::gdk::RGBA> = colors.iter().collect();
     terminal.set_colors(
         Some(&palette.text.rgba()),
         Some(&gtk4::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0)),
-        &ansi,
+        &colors,
     );
     terminal.set_color_cursor(Some(&palette.text.rgba()));
     terminal.set_color_cursor_foreground(Some(&palette.background.rgba()));

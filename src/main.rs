@@ -6,6 +6,7 @@ mod app;
 mod chat;
 mod claude;
 mod dirs;
+mod filter;
 mod groups;
 mod omarchy;
 mod palettes;
@@ -36,6 +37,11 @@ const CLAUDE_SESSION_VARS: [&str; 10] = [
 ];
 
 fn main() -> gtk4::glib::ExitCode {
+    // Modo filtro: roda o `claude` de um chat trocando as cores da faixa das mensagens (`filter.rs`).
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|arg| arg == filter::ARG) {
+        std::process::exit(filter::run(&args[2..]));
+    }
     for var in CLAUDE_SESSION_VARS {
         // SAFETY: nenhuma outra thread existe ainda.
         unsafe { std::env::remove_var(var) };

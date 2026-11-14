@@ -31,8 +31,7 @@ aberta, com os caminhos relativos resolvidos na pasta de quem chamou (`cli::pars
 captura da janela (`shortcuts::find`, com GDK), antes do VTE. `src/term/` (cosmic-term) e `commands.rs` (sugestões do campo
 de mensagem, que estava fora da tela desde o `29b1144`) saíram; estão no histórico.
 
-**Portado (etapas 1 a 3):** tudo o que a versão libcosmic fazia, menos o fundo das mensagens do `claude` recolorido pelo
-tema (o VTE não remapeia uma cor RGB; o `claude` pinta a faixa com `rgb(55,55,55)`) e o campo de mensagem.
+**Portado (etapas 1 a 3):** tudo o que a versão libcosmic fazia, menos o campo de mensagem (estava fora da tela).
 Merge da `gtk` na `omarchy` e instalado pelo `./install.sh` em 2026-11-14.
 
 **Testar sem mexer no app aberto:** `XDG_STATE_HOME=<pasta> dbus-run-session -- target/release/chube`, com o link
@@ -238,6 +237,17 @@ necessários. O app ouve só o título (termprop `xterm.title`, o `window-title-
 saída do processo (`child-exited`). O fundo fica transparente (`set_clear_background(false)` e CSS) para o modo vidro.
 O pid vem do callback do `spawn_async` (`Chat::pid`, numa `Rc<Cell>`). O texto da tela para o modo vem de
 `text_format(Format::Text)`. A pasta de cada aba sai de `/proc/<pid>/cwd`, relida a cada `Poll`.
+
+**Fundo das mensagens do `claude` (`src/filter.rs`, 2026-11-14).** A TUI pinta a faixa das mensagens do usuário com um
+cinza fixo (`48;2;55;55;55` no tema escuro dela, `48;2;240;240;240` no claro; só elas usam esses cinzas) e o VTE não troca uma
+cor RGB ao desenhar. Por isso o terminal de um chat do Claude roda `chube --filtro-cores -- <comando>` (`filter::wrap`): o
+próprio binário, num modo sem GTK, abre um PTY próprio (como o `script`), põe o terminal de fora em modo cru, repassa teclas,
+tamanho (SIGWINCH) e SIGHUP, e troca nas sequências SGR o fundo da faixa pela entrada 237 da paleta de 256 cores e, dentro da
+faixa (até outro fundo ou um reset), toda cor de texto pela 255. `terminal::apply_theme` passa as 256 cores ao VTE com a 237 =
+seleção do tema e a 255 = texto do tema (as outras são as do xterm), então trocar de tema recolore até as faixas já na tela.
+`Chat::pid` é o do filtro (recebe o SIGHUP ao fechar e só sai depois do `claude`); `Chat::agent_pid` é o filho dele
+(`/proc/<pid>/task/<pid>/children`), usado no `~/.claude/sessions/<pid>.json`. O "continuar no terminal do Omarchy" não usa
+o filtro. Testes: o reescritor (inclusive sequência cortada entre leituras) e, em `tests/filtro.rs`, o binário de verdade.
 
 ## Agente do Omarchy (2026-11-13)
 

@@ -974,6 +974,8 @@ impl App {
         }
         let (program, args) = chat.command();
         let argv: Vec<String> = std::iter::once(program).chain(args).collect();
+        // O Claude passa pelo filtro que põe a faixa das mensagens na cor do tema.
+        let argv = if chat.agent == Agent::Claude { crate::filter::wrap(argv) } else { argv };
         let terminal = terminal::new(chat.id, &tx);
         terminal::spawn(&terminal, chat.id, &chat.local_dir(), &argv, chat.pid.clone(), &tx);
         chat.terminal = Some(terminal);
@@ -1113,7 +1115,7 @@ impl App {
             .iter()
             // Os da VPS não têm arquivos aqui: o status vem do título do terminal.
             .filter(|chat| chat.is_alive() && chat.status != Status::Suspended && chat.host.is_none())
-            .map(|chat| (chat.id, chat.agent, chat.pid(), chat.session_id.clone(), chat.codex_thread_hint.clone()))
+            .map(|chat| (chat.id, chat.agent, chat.agent_pid(), chat.session_id.clone(), chat.codex_thread_hint.clone()))
             .collect();
         if targets.is_empty() {
             return Task::none();
