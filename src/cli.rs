@@ -15,6 +15,7 @@ pub struct Flags {
     pub directories: Vec<String>,
 }
 
+#[cfg(test)]
 pub fn parse(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Flags, String> {
     parse_in(args, None)
 }

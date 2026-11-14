@@ -39,7 +39,6 @@ impl Color {
 
 /// Paleta em uso.
 pub struct Palette {
-    pub light: bool,
     /// Fundo da janela, opaco; `alpha` é a opacidade do modo vidro.
     pub background: Color,
     pub alpha: f32,
@@ -58,7 +57,6 @@ pub struct Palette {
 impl Palette {
     pub fn new(colors: ThemeColors, font_px: f32) -> Self {
         Self {
-            light: colors.light,
             background: rgb(colors.background),
             alpha: colors.opacity,
             selection: rgb(colors.selection),
@@ -76,11 +74,6 @@ impl Palette {
     /// Fundo da janela com a opacidade do modo vidro (o Hyprland desfoca o que fica atrás).
     pub fn window(&self) -> Color {
         Color { a: self.alpha, ..self.background }
-    }
-
-    /// Cor do texto com outra opacidade (os tokens `*-alpha` do shell do Omarchy).
-    pub fn text_alpha(&self, alpha: f32) -> Color {
-        Color { a: alpha, ..self.text }
     }
 }
 

@@ -1,14 +1,9 @@
-// Durante a migração para o GTK (branch `gtk`), partes dos módulos só voltam a ser usadas
-// quando os painéis forem portados (nova sessão, sessões salvas, VPS, uso).
-#![allow(dead_code)]
-
 mod agent;
 mod cli;
 mod codex;
 mod app;
 mod chat;
 mod claude;
-mod commands;
 mod dirs;
 mod groups;
 mod omarchy;

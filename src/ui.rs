@@ -12,9 +12,11 @@ use async_channel::Sender;
 use gtk4::prelude::*;
 use gtk4::{gdk, glib, pango};
 
+use crate::agent::Agent;
 use crate::app::{self, App, Focus, Message, Panel, Section};
 use crate::chat::{Chat, Status, TermId};
-use crate::claude;
+use crate::claude::Mode;
+use crate::usage::{self, Window};
 use crate::groups::Category;
 use crate::panels::{NewChatPanel, SessionsPanel};
 use crate::shortcuts;
@@ -31,6 +33,9 @@ pub const ICON_LAPTOP: &str = "\u{f0322}";
 pub const ICON_OMARCHY: &str = "\u{f303}";
 const ICON_HISTORY: &str = "\u{f02da}";
 const ICON_FORK: &str = "\u{e725}";
+const ICON_STOP: &str = "\u{f04d}";
+const ICON_USAGE: &str = "\u{f080}";
+const ICON_REFRESH: &str = "\u{f0450}";
 const ICON_CHATS: &str = "\u{f0b79}";
 const ICON_EXITED: &str = "\u{f057}";
 const ICON_HELP: &str = "\u{f059}";
@@ -64,7 +69,14 @@ pub struct Ui {
     chat_details: gtk4::Label,
     reopen: gtk4::Button,
     fork: gtk4::Button,
+    open_terminal: gtk4::Button,
+    kill_remote: gtk4::Button,
+    mode: gtk4::MenuButton,
+    mode_items: Vec<gtk4::Button>,
     close_panel: gtk4::Button,
+    usage_body: gtk4::Box,
+    usage_key: RefCell<Vec<String>>,
+    refresh: gtk4::Button,
     new_chat: NewChatPanel,
     sessions: SessionsPanel,
     close_chat: gtk4::Button,
@@ -104,7 +116,22 @@ impl Ui {
             .vexpand(true)
             .child(&list)
             .build();
-        let sidebar = card(&section_header(&header), &scroll);
+        let chats_card = card(&section_header(&header), &scroll);
+        chats_card.set_vexpand(true);
+
+        // Uso do plano e contexto do chat em foco.
+        let refresh = icon_button(ICON_REFRESH, "Atualizar agora", &tx, || Message::RefreshInfo);
+        let header = row!(&heading(ICON_USAGE, "uso"), &fill(), &refresh);
+        let usage_body = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        let usage_scroll = gtk4::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .propagate_natural_height(true)
+            .child(&usage_body)
+            .build();
+        let usage_card = card(&section_header(&header), &usage_scroll);
+        let sidebar = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        sidebar.append(&chats_card);
+        sidebar.append(&usage_card);
         sidebar.set_size_request(220, -1);
 
         // Chat em foco.
@@ -119,17 +146,23 @@ impl Ui {
         chat_details.set_ellipsize(pango::EllipsizeMode::Middle);
         let reopen = text_button("reabrir", "Retomar ou reiniciar esta sessão", &tx, || Message::ReopenChat);
         let fork = icon_button(ICON_FORK, "Criar sub-chat com o contexto deste chat", &tx, || Message::SubChat);
+        let open_terminal = icon_button(ICON_TERMINAL, "Continuar no terminal do Omarchy (fecha o chat aqui)", &tx, || {
+            Message::OpenInTerminal
+        });
+        let kill_remote = icon_button(ICON_STOP, "Encerrar o agente na VPS (mata o tmux)", &tx, || Message::KillRemote);
+        let (mode, mode_items) = mode_selector(&tx);
         let close_panel = icon_button(ICON_CLOSE, "Voltar ao chat (Esc)", &tx, || Message::ClosePanel);
         let close_chat = gtk4::Button::with_label(ICON_CLOSE);
         close_chat.add_css_class("icon");
         let show_terminal = icon_button(ICON_HIDE_LEFT, "Mostrar o terminal (Ctrl+Shift+3)", &tx, || {
             Message::ShowSection(Section::Terminal)
         });
-        let title_line = row!(&chat_glyph, &chat_title, &reopen, &fork, &close_chat, &close_panel, &show_terminal);
+        let title_line = row!(&chat_glyph, &chat_title, &reopen, &fork, &open_terminal, &kill_remote, &close_chat, &close_panel, &show_terminal);
         let titles = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         titles.set_hexpand(true);
         titles.append(&title_line);
-        titles.append(&chat_details);
+        chat_details.set_hexpand(true);
+        titles.append(&row!(&chat_details, &mode));
         let header = row!(&show_sidebar, &titles);
         let notice = label("", &["warning"]);
         notice.set_wrap(true);
@@ -223,7 +256,14 @@ impl Ui {
             chat_details,
             reopen,
             fork,
+            open_terminal,
+            kill_remote,
+            mode,
+            mode_items,
             close_panel,
+            usage_body,
+            usage_key: RefCell::new(vec!["(nunca)".into()]),
+            refresh,
             new_chat: new_chat_panel,
             sessions: sessions_panel,
             close_chat,
@@ -266,6 +306,7 @@ impl Ui {
 
         self.sync_list(app);
         self.sync_chat(app);
+        self.sync_usage(app);
         self.sync_tabs(app);
 
         if let Some(focus) = app.focus.take() {
@@ -425,6 +466,9 @@ impl Ui {
             self.chat_details.set_text("Esc volta ao chat");
             self.reopen.set_visible(false);
             self.fork.set_visible(false);
+            self.open_terminal.set_visible(false);
+            self.kill_remote.set_visible(false);
+            self.mode.set_visible(false);
             self.close_chat.set_visible(false);
             self.notice.set_visible(app.notice.is_some());
             self.notice.set_text(app.notice.as_deref().unwrap_or_default());
@@ -442,6 +486,22 @@ impl Ui {
                 let can_fork = chat.session_id.is_some() && chat.status != Status::Starting && !chat.attach_only;
                 self.fork.set_visible(true);
                 self.fork.set_sensitive(can_fork);
+                self.open_terminal.set_visible(true);
+                self.open_terminal.set_sensitive(can_fork || chat.host.is_some());
+                self.kill_remote.set_visible(chat.host.is_some() && !chat.attach_only);
+                // Também na VPS: o modo é lido no rodapé da TUI e trocado com Shift+Tab, pelo tmux.
+                self.mode.set_visible(chat.is_alive() && chat.agent == Agent::Claude && !chat.attach_only);
+                for (index, item) in self.mode_items.iter().enumerate() {
+                    if chat.mode.is_some_and(|mode| mode.index() == index) {
+                        item.add_css_class("selected");
+                    } else {
+                        item.remove_css_class("selected");
+                    }
+                }
+                self.mode.set_label(&match chat.mode {
+                    Some(mode) => format!("{} {}", mode_glyph(mode), Mode::LABELS[mode.index()].to_lowercase()),
+                    None => "modo".to_owned(),
+                });
                 self.close_chat.set_visible(true);
                 self.close_chat.set_widget_name(&app.focused.to_string());
                 self.close_chat.set_tooltip_text(Some(close_tip(chat)));
@@ -452,6 +512,9 @@ impl Ui {
                 self.chat_details.set_text("");
                 self.reopen.set_visible(false);
                 self.fork.set_visible(false);
+                self.open_terminal.set_visible(false);
+                self.kill_remote.set_visible(false);
+                self.mode.set_visible(false);
                 self.close_chat.set_visible(false);
             }
         }
@@ -514,6 +577,183 @@ impl Ui {
     }
 }
 
+impl Ui {
+    /// Painel "uso": contexto do chat em foco e limites do plano (do Claude ou, num chat do
+    /// Codex, os dele). Refeito só quando o que ele mostra muda.
+    fn sync_usage(&self, app: &App) {
+        let focused = app.chats.get(app.focused);
+        let context_tokens = focused.map_or(0, |chat| chat.context_tokens);
+        let is_codex = focused.is_some_and(|chat| chat.agent == Agent::Codex);
+        let limits: &[usage::Limit] = if is_codex {
+            match &app.codex_usage {
+                Some(limits) => limits,
+                None => focused.map(|chat| chat.codex_limits.as_slice()).unwrap_or_default(),
+            }
+        } else {
+            &app.limits
+        };
+        let known_window = if is_codex {
+            focused.and_then(|chat| chat.context_window)
+        } else {
+            focused
+                .and_then(|chat| chat.active_model.as_ref())
+                .and_then(|model| app.context_windows.get(model).copied().flatten())
+        };
+
+        let mut meters: Vec<Meter> = Vec::new();
+        if context_tokens == 0 || (is_codex && known_window.is_none()) {
+            meters.push(Meter::new("contexto", None, None, None));
+        } else {
+            // Enquanto o `/context` não responde, chuta 200 mil; acima disso, só pode ser 1 milhão.
+            let guess: u32 = if context_tokens > 200_000 { 1_000_000 } else { 200_000 };
+            let window = if is_codex {
+                known_window.unwrap_or(1).max(1)
+            } else {
+                known_window.map_or(guess, |window| window.max(guess))
+            };
+            meters.push(Meter::new(
+                "contexto",
+                Some(context_tokens as f32 / window as f32),
+                Some(format!("{} / {}", app::short_tokens(context_tokens), app::short_tokens(window))),
+                None,
+            ));
+        }
+        if limits.is_empty() {
+            meters.push(Meter::new("sessão (5h)", None, None, None));
+            meters.push(Meter::new("semana", None, None, None));
+        }
+        for limit in limits {
+            let label = match &limit.window {
+                Window::Session => "sessão (5h)".to_owned(),
+                Window::Week(models) if models == "all models" => "semana".to_owned(),
+                Window::Week(models) => format!("semana · {}", models.to_lowercase()),
+            };
+            meters.push(Meter::new(&label, Some(limit.used), None, limit.resets.map(usage::describe_reset)));
+        }
+
+        let working = app.chats.iter().filter(|chat| chat.status == Status::Working).count();
+        let mut footer = vec![(format!("{} chats · {working} trabalhando", app.chats.len()), "dim")];
+        if let Some(account) = app.account.as_ref().filter(|_| !is_codex) {
+            footer.push((format!("conta {account}"), "dim"));
+        }
+        footer.push(if is_codex && app.codex_usage.is_none() {
+            ("codex · limites do histórico; /status na sessão".to_owned(), "dim")
+        } else if app.fetching_usage {
+            ("atualizando…".to_owned(), "dim")
+        } else if let Some(error) = &app.usage_error {
+            (format!("erro ao atualizar: {error}"), "danger")
+        } else if let Some(time) = &app.usage_updated {
+            (format!("limites de {time}"), "dim")
+        } else {
+            ("ainda não atualizado".to_owned(), "dim")
+        });
+        self.refresh.set_sensitive(!app.fetching_usage);
+
+        let key: Vec<String> = meters
+            .iter()
+            .map(|meter| format!("{meter:?}"))
+            .chain(footer.iter().map(|(text, class)| format!("{text}{class}")))
+            .collect();
+        if *self.usage_key.borrow() == key {
+            return;
+        }
+        *self.usage_key.borrow_mut() = key;
+        while let Some(child) = self.usage_body.first_child() {
+            self.usage_body.remove(&child);
+        }
+        for meter in meters {
+            self.usage_body.append(&meter.widget());
+        }
+        let lines = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        for (text, class) in footer {
+            let line = label(&text, &[class]);
+            line.set_wrap(true);
+            lines.append(&line);
+        }
+        self.usage_body.append(&lines);
+    }
+}
+
+/// Uma linha do painel "uso": rótulo, detalhe e porcentagem; embaixo, a barra e uma nota.
+#[derive(Debug)]
+struct Meter {
+    label: String,
+    value: Option<f32>,
+    detail: Option<String>,
+    note: Option<String>,
+}
+
+impl Meter {
+    fn new(label: &str, value: Option<f32>, detail: Option<String>, note: Option<String>) -> Self {
+        Self { label: label.to_owned(), value: value.map(|value| value.clamp(0.0, 1.0)), detail, note }
+    }
+
+    fn widget(&self) -> gtk4::Box {
+        let level = match self.value {
+            Some(value) if value >= 0.9 => "danger",
+            Some(value) if value >= 0.7 => "warning",
+            _ => "accent",
+        };
+        let name = label(&self.label, &[]);
+        name.set_hexpand(true);
+        let head = row!(&name);
+        if let Some(detail) = &self.detail {
+            head.append(&label(&format!("{detail}  "), &["dim"]));
+        }
+        head.append(&match self.value {
+            Some(value) => label(&format!("{:.0}%", value * 100.0), &[level]),
+            None => label("—", &["dim"]),
+        });
+        let bar = gtk4::ProgressBar::new();
+        bar.set_fraction(f64::from(self.value.unwrap_or(0.0)));
+        bar.add_css_class("meter");
+        bar.add_css_class(level);
+        let meter = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        meter.append(&head);
+        meter.append(&bar);
+        if let Some(note) = &self.note {
+            meter.append(&label(&format!("└ {note}"), &["dim"]));
+        }
+        meter
+    }
+}
+
+/// Botão do modo de permissão com o menu dos modos, como o seletor da TUI.
+fn mode_selector(tx: &Sender<Message>) -> (gtk4::MenuButton, Vec<gtk4::Button>) {
+    let menu = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    let popover = gtk4::Popover::new();
+    popover.set_has_arrow(false);
+    popover.add_css_class("menu-card");
+    let mut items = Vec::new();
+    for (index, mode) in Mode::ALL.iter().enumerate() {
+        let item = gtk4::Button::new();
+        item.set_child(Some(&label(&format!("{} {}", mode_glyph(*mode), Mode::LABELS[index].to_lowercase()), &[])));
+        item.add_css_class("choice");
+        item.set_halign(gtk4::Align::Fill);
+        items.push(item.clone());
+        let sender = tx.clone();
+        let parent = popover.clone();
+        item.connect_clicked(move |_| {
+            parent.popdown();
+            let _ = sender.try_send(Message::SetMode(index));
+        });
+        menu.append(&item);
+    }
+    popover.set_child(Some(&menu));
+    let button = gtk4::MenuButton::builder().popover(&popover).label("modo").always_show_arrow(true).build();
+    button.add_css_class("mode");
+    button.set_tooltip_text(Some("Modo de permissão (Shift+Tab no terminal)"));
+    (button, items)
+}
+
+/// Ícone do modo, como o símbolo do rodapé da TUI (⏸ / ⏵⏵).
+fn mode_glyph(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Manual | Mode::Plan => "\u{f04c}",
+        Mode::AcceptEdits | Mode::Auto | Mode::Bypass => "\u{f04e}",
+    }
+}
+
 fn page_name(id: TermId) -> String {
     format!("t{id}")
 }
@@ -529,14 +769,11 @@ fn terminal_page(terminal: &vte4::Terminal) -> gtk4::ScrolledWindow {
 /// Segunda linha do cabeçalho do chat: agente · pasta · modelo · contexto.
 fn chat_details(chat: &Chat) -> String {
     let mut parts = vec![chat.agent_label(), chat.place_label()];
-    if let Some(model) = &chat.active_model {
+    if let Some(model) = chat.active_model.as_ref().or(chat.model.as_ref()) {
         parts.push(model.clone());
     }
-    if chat.context_tokens > 0 {
-        parts.push(format!("{} de contexto", app::short_tokens(chat.context_tokens)));
-    }
-    if let Some(mode) = chat.mode {
-        parts.push(claude::Mode::LABELS[mode.index()].to_lowercase());
+    if let Some(parent) = &chat.parent {
+        parts.push(format!("sub-chat de \"{parent}\""));
     }
     parts.join(" · ")
 }
@@ -668,6 +905,7 @@ fn stylesheet() -> String {
         "
 window.chube {{ background: {window}; color: {fg}; font-family: '{family}'; font-size: {px}px; }}
 window.chube * {{ border-radius: 0; }}
+popover.menu-card {{ font-family: '{family}'; font-size: {px}px; color: {fg}; }}
 .card {{ border: 1px solid {border}; margin: 4px; padding: 4px; }}
 .section-header {{ border-bottom: 1px solid {line}; padding-bottom: 4px; }}
 .bold {{ font-weight: bold; }}
@@ -704,6 +942,13 @@ entry {{ background: {button}; border: 1px solid {button_border}; box-shadow: no
 entry:focus-within {{ border-color: {accent}; outline: none; }}
 .blocked {{ opacity: 0.45; }}
 button:disabled {{ opacity: 0.4; }}
+progressbar.meter trough {{ min-height: 3px; background: {selection}; border: none; box-shadow: none; }}
+progressbar.meter progress {{ min-height: 3px; background: {accent}; border: none; }}
+progressbar.meter.warning progress {{ background: {warning}; }}
+progressbar.meter.danger progress {{ background: {danger}; }}
+menubutton.mode > button {{ background: none; border: none; box-shadow: none; padding: 0 4px; min-height: 0; color: {fg}; }}
+menubutton.mode > button:hover {{ background: {hover}; }}
+popover.menu-card > contents {{ background: {menu_bg}; border: 1px solid {accent}; padding: 4px; box-shadow: none; }}
 .section-header button {{ margin-left: 2px; }}
 ",
         window = palette.window().css(),
@@ -721,5 +966,7 @@ button:disabled {{ opacity: 0.4; }}
         button = text(0.04),
         button_border = text(0.4),
         tooltip = palette.background.with_alpha(0.97).css(),
+        selection = palette.selection.css(),
+        menu_bg = palette.background.css(),
     )
 }

@@ -17,7 +17,6 @@ type BoxFuture = Pin<Box<dyn Future<Output = Message> + Send>>;
 
 pub enum Task {
     None,
-    Batch(Vec<Task>),
     Future(BoxFuture),
     /// Manda a mensagem depois da espera.
     After(Duration, Message),
@@ -44,10 +43,6 @@ impl Task {
     pub fn after(delay: Duration, message: Message) -> Self {
         Task::After(delay, message)
     }
-
-    pub fn batch(tasks: impl IntoIterator<Item = Task>) -> Self {
-        Task::Batch(tasks.into_iter().collect())
-    }
 }
 
 /// Runtime do tokio para os futuros das tarefas e as conexões de estado da VPS.
@@ -67,11 +62,6 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
 pub fn run(task: Task, tx: &Sender<Message>) {
     match task {
         Task::None => {}
-        Task::Batch(tasks) => {
-            for task in tasks {
-                run(task, tx);
-            }
-        }
         Task::Future(future) => {
             let tx = tx.clone();
             runtime().spawn(async move {

@@ -15,14 +15,14 @@ use gtk4::prelude::*;
 use gtk4::{gio, glib};
 
 use crate::agent::Agent;
-use crate::chat::{Chat, Status, TMUX_ID_PREFIX, TermId};
-use crate::claude::{self, Start};
+use crate::chat::{Chat, ModeChange, Status, TMUX_ID_PREFIX, TermId};
+use crate::claude::{self, Mode, Start};
 use crate::cli::{self, Flags};
 use crate::codex;
 use crate::dirs;
 use crate::groups::{self, Category, CategoryGroup};
 use crate::omarchy;
-use crate::remote::{self, Listing};
+use crate::remote::{self, Listing, RemoteStatus};
 use crate::restore::{self, OpenChat, OpenChats};
 use crate::sessions::{self, Running, SavedSession, Stats};
 use crate::shortcuts::Shortcut;
@@ -30,6 +30,7 @@ use crate::task::{self, Task};
 use crate::terminal;
 use crate::themes;
 use crate::ui::Ui;
+use crate::usage::{self, Limit};
 
 pub const APP_ID: &str = "com.pedro.Chube";
 /// Intervalo da conferência do tema do Omarchy (o Chube muda junto com `omarchy theme set`).
@@ -37,6 +38,15 @@ const THEME_CHECK_EVERY: Duration = Duration::from_secs(2);
 /// Intervalo da leitura do status das sessões (`~/.claude/sessions`).
 const POLL_EVERY: Duration = Duration::from_secs(1);
 const TITLE_MAX_CHARS: usize = 40;
+/// Intervalo de atualização automática do painel de uso. Os limites vêm do arquivo que o
+/// Omarchy atualiza; só sem ele o Chube roda o `/usage`.
+const REFRESH_EVERY: Duration = Duration::from_secs(120);
+/// Espera entre um Shift+Tab e a leitura do modo na tela.
+const MODE_STEP_DELAY: Duration = Duration::from_millis(250);
+/// Mais Shift+Tab do que isso e o modo pedido não está no ciclo.
+const MODE_MAX_STEPS: u8 = 6;
+/// Tempo máximo esperando o agente de um chat sair antes de abrir a sessão no terminal do Omarchy.
+const EXIT_WAIT: Duration = Duration::from_secs(5);
 
 /// O que abrir num chat novo: o agente padrão do Omarchy no modo do `omarchy agent`, ou um
 /// agente escolhido, no modo dele.
@@ -118,6 +128,24 @@ pub enum Message {
     ThemeChecked(String),
     /// Uma tarefa em segundo plano entrou em pânico.
     TaskFailed(String),
+    RefreshInfo,
+    /// Limites do Claude (do Omarchy ou do `/usage`), os do Codex (do Omarchy) e a hora da
+    /// leitura feita pelo Omarchy.
+    UsageFetched(Result<Vec<Limit>, String>, Option<Vec<Limit>>, Option<String>),
+    ContextWindowFetched(String, Option<u32>),
+    /// Estado dos chats de um host da VPS.
+    RemotePolled(String, Result<Vec<RemoteStatus>, String>),
+    /// Encerra o agente do chat em foco na VPS (mata o tmux dele).
+    KillRemote,
+    RemoteKilled(Result<(), String>),
+    /// Leva a sessão do chat em foco para o terminal do Omarchy.
+    OpenInTerminal,
+    /// Se a sessão do chat já tem `.jsonl` (sem ele, o `--resume` falha).
+    OpenInTerminalChecked(TermId, bool),
+    OpenedInTerminal(Result<(), String>),
+    /// Troca o modo de permissão do chat em foco (índice em `Mode::ALL`).
+    SetMode(usize),
+    ModeStep(TermId),
 }
 
 /// Estado de um chat lido do disco pelo `Message::Poll`.
@@ -195,6 +223,23 @@ pub struct App {
     /// Última lista de chats gravada (`restore`), para só gravar quando mudar.
     open_chats: OpenChats,
     pub focus: Option<Focus>,
+    /// Limites do plano, do Omarchy ou do `/usage`.
+    pub limits: Vec<Limit>,
+    pub usage_updated: Option<String>,
+    pub usage_error: Option<String>,
+    pub fetching_usage: bool,
+    /// Janela de contexto de cada modelo, pelo `/context`; `None` enquanto busca ou se falhou
+    /// (não tenta de novo a cada `Poll`).
+    pub context_windows: HashMap<String, Option<u32>>,
+    /// Limites do Codex lidos do Omarchy (os do histórico da sessão, sem ele).
+    pub codex_usage: Option<Vec<Limit>>,
+    /// Conta ativa no `omarchy agent account`.
+    pub account: Option<String>,
+    /// Conexões de estado abertas, uma por host da VPS: soltar o `Sender` encerra a conexão.
+    remote_polls: HashMap<String, Sender<()>>,
+    /// Hosts cuja conexão de estado caiu ou foi negada: não reabre sozinha (cada conexão pede
+    /// permissão), só quando um chat de lá (re)conecta ou a lista de lá carrega.
+    remote_poll_stopped: HashSet<String>,
     tx: Sender<Message>,
 }
 
@@ -238,6 +283,15 @@ impl App {
             notice: None,
             open_chats: OpenChats::default(),
             focus: Some(Focus::Chat),
+            limits: Vec::new(),
+            usage_updated: None,
+            usage_error: None,
+            fetching_usage: false,
+            context_windows: HashMap::new(),
+            codex_usage: None,
+            account: omarchy::active_account("claude"),
+            remote_polls: HashMap::new(),
+            remote_poll_stopped: HashSet::new(),
             tx,
         };
         // Volta a lista de chats da última execução, em espera; só o do foco abre agora.
@@ -264,6 +318,7 @@ impl App {
         let task = self.handle(message);
         self.wake_focused();
         self.save_open_chats();
+        self.sync_remote_polls();
         task
     }
 
@@ -368,7 +423,10 @@ impl App {
             }
             Message::RemoteListed(host, result) => {
                 let state = match result {
-                    Ok(listing) => RemoteState::Loaded(listing),
+                    Ok(listing) => {
+                        self.remote_poll_stopped.remove(&host);
+                        RemoteState::Loaded(listing)
+                    }
                     Err(error) => RemoteState::Failed(error),
                 };
                 self.remote_sessions.insert(host, state);
@@ -435,6 +493,7 @@ impl App {
             Message::Polled(list) => {
                 self.polling = false;
                 self.apply_poll(list);
+                return self.fetch_context_window();
             }
             Message::TermTitle(id, title) => self.term_title(id, &title),
             Message::TermExit(id) => {
@@ -485,8 +544,250 @@ impl App {
                 }
             }
             Message::TaskFailed(error) => log::error!("tarefa falhou: {error}"),
+            Message::RefreshInfo => return self.refresh_usage(),
+            Message::UsageFetched(result, codex_limits, fetched) => {
+                self.fetching_usage = false;
+                self.codex_usage = codex_limits;
+                match result {
+                    Ok(limits) => {
+                        self.limits = limits;
+                        self.usage_error = None;
+                        self.usage_updated = Some(fetched.unwrap_or_else(now_hms));
+                    }
+                    Err(error) => self.usage_error = Some(error),
+                }
+            }
+            Message::ContextWindowFetched(model, window) => {
+                self.context_windows.insert(model, window);
+            }
+            Message::RemotePolled(host, result) => match result {
+                Ok(list) => {
+                    self.apply_remote_poll(&host, list);
+                    return self.fetch_context_window();
+                }
+                // Conexão negada ou caída: fica o status vindo do título até reconectar.
+                Err(error) => {
+                    log::warn!("estado de {host}: {error}");
+                    self.remote_polls.remove(&host);
+                    self.remote_poll_stopped.insert(host);
+                }
+            },
+            Message::KillRemote => {
+                let Some(chat) = self.chats.get(self.focused) else {
+                    return Task::none();
+                };
+                let (Some(host), Some(tmux)) = (chat.host.clone(), chat.tmux.clone()) else {
+                    return Task::none();
+                };
+                self.remote_sessions.remove(&host);
+                self.close_chat(self.focused);
+                return Task::future(async move { Message::RemoteKilled(remote::kill(host, tmux).await) });
+            }
+            Message::RemoteKilled(result) => {
+                if let Err(error) = result {
+                    self.notice = Some(format!("não consegui encerrar na VPS: {error}"));
+                }
+            }
+            Message::OpenInTerminal => {
+                self.notice = None;
+                let Some(chat) = self.chats.get(self.focused) else {
+                    return Task::none();
+                };
+                let id = chat.id;
+                // Na VPS, o terminal do Omarchy entra no mesmo tmux: não depende do histórico.
+                if chat.host.is_some() {
+                    return self.handle(Message::OpenInTerminalChecked(id, true));
+                }
+                let Some(session_id) = chat.session_id.clone() else {
+                    return Task::none();
+                };
+                let agent = chat.agent;
+                return Task::blocking(move || Message::OpenInTerminalChecked(id, agent.session_file(&session_id).is_some()));
+            }
+            Message::OpenInTerminalChecked(id, saved) => {
+                let Some(index) = self.chats.iter().position(|chat| chat.id == id) else {
+                    return Task::none();
+                };
+                let chat = &self.chats[index];
+                let pid = chat.pid();
+                let cwd = chat.local_dir();
+                let command = if chat.host.is_some() {
+                    // Fechar o chat só desconecta; o terminal novo entra no mesmo tmux da VPS.
+                    let mut copy = chat.reopen(0).expect("chat da VPS sempre reabre");
+                    copy.command()
+                } else {
+                    let Some(session_id) = chat.session_id.clone().filter(|_| saved) else {
+                        self.notice = Some("a sessão ainda não foi salva: mande uma mensagem antes.".into());
+                        return Task::none();
+                    };
+                    chat.agent.command(&Start::Resume { session_id }, chat.model.as_deref(), None, chat.auto)
+                };
+                self.close_chat(index);
+                return Task::future(async move { Message::OpenedInTerminal(open_in_terminal(pid, cwd, command).await) });
+            }
+            Message::OpenedInTerminal(result) => {
+                if let Err(error) = result {
+                    self.notice = Some(format!("não consegui abrir o terminal do Omarchy: {error}"));
+                }
+            }
+            Message::SetMode(index) => {
+                let Some(chat) = self.chats.get_mut(self.focused) else {
+                    return Task::none();
+                };
+                let target = Mode::ALL[index.min(Mode::ALL.len() - 1)];
+                chat.read_mode();
+                if chat.agent != Agent::Claude || chat.mode == Some(target) || !chat.is_alive() {
+                    return Task::none();
+                }
+                chat.mode_change = Some(ModeChange { target, start: chat.mode, steps: 1 });
+                chat.send(claude::NEXT_MODE_KEY);
+                return Task::after(MODE_STEP_DELAY, Message::ModeStep(chat.id));
+            }
+            Message::ModeStep(id) => {
+                let Some(chat) = self.chats.iter_mut().find(|chat| chat.id == id) else {
+                    return Task::none();
+                };
+                let Some(mut change) = chat.mode_change.take() else {
+                    return Task::none();
+                };
+                chat.read_mode();
+                let arrived = chat.mode == Some(change.target);
+                // Voltou ao modo inicial: o pedido não está no ciclo (ex.: "Sem permissões").
+                let looped = change.start.is_some() && chat.mode == change.start;
+                if arrived || looped || change.steps >= MODE_MAX_STEPS || !chat.is_alive() {
+                    return Task::none();
+                }
+                change.steps += 1;
+                chat.mode_change = Some(change);
+                chat.send(claude::NEXT_MODE_KEY);
+                return Task::after(MODE_STEP_DELAY, Message::ModeStep(id));
+            }
         }
         Task::none()
+    }
+
+    /// Lê os limites que o Omarchy mantém (`omarchy agent usage`) ou, sem eles, roda o
+    /// `/usage`, se já não houver uma busca em andamento.
+    fn refresh_usage(&mut self) -> Task {
+        if self.fetching_usage {
+            return Task::none();
+        }
+        self.fetching_usage = true;
+        self.account = omarchy::active_account("claude");
+        Task::future(async {
+            let (claude, codex) = tokio::task::spawn_blocking(|| (omarchy::usage("claude"), omarchy::usage("codex")))
+                .await
+                .unwrap_or((None, None));
+            let codex = codex.map(|usage| usage.limits);
+            match claude {
+                Some(usage) => {
+                    let fetched = usage.fetched.map(|time| {
+                        let time = time.format("%H:%M").to_string();
+                        if usage.stale { format!("{time} (desatualizado)") } else { time }
+                    });
+                    Message::UsageFetched(Ok(usage.limits), codex, fetched)
+                }
+                None => Message::UsageFetched(usage::fetch().await, codex, None),
+            }
+        })
+    }
+
+    /// Busca a janela de contexto do modelo do chat em foco, se ainda não foi buscada.
+    fn fetch_context_window(&mut self) -> Task {
+        let Some(chat) = self.chats.get(self.focused).filter(|chat| chat.agent == Agent::Claude) else {
+            return Task::none();
+        };
+        let Some(model) = chat.active_model.clone() else {
+            return Task::none();
+        };
+        if self.context_windows.contains_key(&model) {
+            return Task::none();
+        }
+        self.context_windows.insert(model.clone(), None);
+        Task::future(async move {
+            let window = usage::context_window(model.clone()).await;
+            if let Err(error) = &window {
+                log::warn!("janela de contexto de {model}: {error}");
+            }
+            Message::ContextWindowFetched(model, window.ok())
+        })
+    }
+
+    /// Hosts que precisam da conexão de estado: com um chat do Claude vivo, cujo agente já subiu
+    /// (a chave já foi liberada; antes disso, a conexão de estado pediria a senha de novo).
+    fn remote_poll_hosts(&self) -> HashSet<String> {
+        self.chats
+            .iter()
+            .filter(|chat| {
+                chat.is_alive()
+                    && chat.agent == Agent::Claude
+                    && chat.terminal.is_some()
+                    && !matches!(chat.status, Status::Starting | Status::Suspended)
+            })
+            .filter_map(|chat| chat.host.clone())
+            .filter(|host| !self.remote_poll_stopped.contains(host))
+            .collect()
+    }
+
+    /// Abre a conexão de estado dos hosts que passaram a precisar dela e fecha a dos outros.
+    fn sync_remote_polls(&mut self) {
+        let wanted = self.remote_poll_hosts();
+        self.remote_polls.retain(|host, _| wanted.contains(host));
+        for host in wanted {
+            if self.remote_polls.contains_key(&host) {
+                continue;
+            }
+            let (stop, stopped) = async_channel::bounded::<()>(1);
+            self.remote_polls.insert(host.clone(), stop);
+            let tx = self.tx.clone();
+            task::runtime().spawn(async move {
+                let (output, input) = async_channel::bounded(4);
+                let poll = tokio::spawn(remote::poll(host, output));
+                loop {
+                    tokio::select! {
+                        item = input.recv() => match item {
+                            Ok((host, result)) => {
+                                if tx.send(Message::RemotePolled(host, result)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        },
+                        // O `Sender` foi solto (o host saiu da lista): fecha a conexão.
+                        _ = stopped.recv() => break,
+                    }
+                }
+                // Soltar a entrada faz o próximo envio do `poll` falhar; ele sai e o `ssh` morre.
+                drop(input);
+                let _ = poll.await;
+            });
+        }
+    }
+
+    fn apply_remote_poll(&mut self, host: &str, list: Vec<RemoteStatus>) {
+        for polled in list {
+            let Some(chat) = self.chats.iter_mut().find(|chat| {
+                chat.is_alive() && chat.host.as_deref() == Some(host) && chat.tmux.as_deref() == Some(polled.tmux.as_str())
+            }) else {
+                continue;
+            };
+            if let Some(session_id) = polled.session_id {
+                // `/clear` troca a sessão (o contexto zera); num sub-chat, o id aparece aqui.
+                if chat.session_id.as_ref().is_some_and(|id| *id != session_id) {
+                    chat.context_tokens = 0;
+                }
+                chat.session_id = Some(session_id);
+            }
+            if let Some(status) = polled.status.as_deref().and_then(Status::from_claude) {
+                chat.status = status;
+            }
+            if polled.model.is_some() {
+                chat.active_model = polled.model;
+            }
+            if polled.context_tokens > 0 {
+                chat.context_tokens = polled.context_tokens;
+            }
+        }
     }
 
     fn handle_shortcut(&mut self, shortcut: Shortcut) {
@@ -656,6 +957,9 @@ impl App {
         let chat = &mut self.chats[index];
         if chat.terminal.is_some() || !chat.is_alive() || chat.status == Status::Suspended {
             return;
+        }
+        if let Some(host) = &chat.host {
+            self.remote_poll_stopped.remove(host);
         }
         let (program, args) = chat.command();
         let argv: Vec<String> = std::iter::once(program).chain(args).collect();
@@ -988,8 +1292,12 @@ fn start(application: &gtk4::Application, flags: Flags) -> Sender<Message> {
     }
     ui.present();
 
-    let timers: [(Duration, fn() -> Message); 2] =
-        [(POLL_EVERY, || Message::Poll), (THEME_CHECK_EVERY, || Message::CheckTheme)];
+    let timers: [(Duration, fn() -> Message); 3] = [
+        (POLL_EVERY, || Message::Poll),
+        (THEME_CHECK_EVERY, || Message::CheckTheme),
+        (REFRESH_EVERY, || Message::RefreshInfo),
+    ];
+    let _ = tx.try_send(Message::RefreshInfo);
     for (every, message) in timers {
         let tx = tx.clone();
         glib::timeout_add_local(every, move || {
@@ -1015,6 +1323,49 @@ fn start(application: &gtk4::Application, flags: Flags) -> Sender<Message> {
         }
     });
     tx
+}
+
+/// Espera o agente do chat fechado sair (ao receber o SIGHUP, ele grava a sessão) e abre a sessão
+/// no terminal do Omarchy, numa janela de agente (`org.omarchy.agent`, como as do `omarchy agent`),
+/// na pasta do chat.
+async fn open_in_terminal(pid: Option<u32>, cwd: PathBuf, (program, args): (String, Vec<String>)) -> Result<(), String> {
+    if let Some(pid) = pid {
+        let step = Duration::from_millis(50);
+        let mut waited = Duration::ZERO;
+        while waited < EXIT_WAIT && process_running(pid) {
+            tokio::time::sleep(step).await;
+            waited += step;
+        }
+    }
+    // O `omarchy-launch-tui` passa pelo `uwsm-app`, que não leva a pasta atual: o `sh` entra nela.
+    let mut child = tokio::process::Command::new("omarchy-launch-tui")
+        .arg("--app-id=org.omarchy.agent")
+        .args(["sh", "-c", "cd \"$0\" && exec \"$@\""])
+        .arg(&cwd)
+        .arg(program)
+        .args(args)
+        .current_dir(&cwd)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    // O lançador se separa e sai logo; o `wait` evita deixar um processo zumbi.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    Ok(())
+}
+
+/// O processo existe e não é um zumbi esperando ser recolhido.
+fn process_running(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        // O estado vem depois do nome, que fica entre parênteses e pode ter espaços.
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_some_and(|state| state != "Z")
+    })
+}
+
+fn now_hms() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
 /// O que o painel de nova sessão mostra para um agente escolhido sem o modo do Omarchy.
@@ -1067,6 +1418,20 @@ pub fn short_tokens(tokens: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_running_ve_processos_vivos_e_zumbis() {
+        assert!(process_running(std::process::id()));
+        assert!(!process_running(u32::MAX));
+
+        // Um filho que saiu e ainda não foi recolhido é zumbi: conta como encerrado.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!process_running(pid));
+        child.wait().unwrap();
+        assert!(!process_running(pid));
+    }
 
     #[test]
     fn short_tokens_abrevia() {

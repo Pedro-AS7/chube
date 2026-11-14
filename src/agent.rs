@@ -9,18 +9,8 @@ pub enum Agent {
 }
 
 impl Agent {
-    pub const LABELS: [&'static str; 2] = ["Claude Code", "Codex"];
-
     pub fn key(self) -> &'static str {
         match self { Self::Claude => "claude", Self::Codex => "codex" }
-    }
-
-    pub fn label(self) -> &'static str {
-        Self::LABELS[self.index()]
-    }
-
-    pub fn index(self) -> usize {
-        match self { Self::Claude => 0, Self::Codex => 1 }
     }
 
     pub fn parse(value: &str) -> Option<Self> {

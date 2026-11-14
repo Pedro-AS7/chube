@@ -345,13 +345,6 @@ impl Chat {
         }
     }
 
-    /// Cola o texto no `claude` (bracketed paste: quebras de linha não enviam a mensagem).
-    pub fn paste(&self, text: &str) {
-        if let Some(terminal) = &self.terminal {
-            terminal.paste_text(text);
-        }
-    }
-
     /// Relê o modo no rodapé da TUI; mantém o anterior se o rodapé não está na tela.
     pub fn read_mode(&mut self) {
         if self.agent != Agent::Claude {
