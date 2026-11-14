@@ -256,9 +256,10 @@ Para trazer novidades do upstream, compare com o cosmic-term e reaplique só ess
 - Status: sem `~/.claude/sessions` lá, vem do título (`claude::status_from_title`): `✳` pronto, spinner trabalhando.
   "precisa de você" não é detectado; contexto e modelo não aparecem ("na VPS"). O seletor de modo fica escondido.
 - SSH: todas as conexões usam `ControlMaster=auto`, `ControlPath=$XDG_RUNTIME_DIR/chube-ssh-%C` e `ControlPersist=15m`.
-  A chave do `vps-r1` tem senha e a sessão não tem agente SSH: o primeiro chat pede a senha **no terminal dele**, e as
-  consultas em segundo plano (`BatchMode=yes`) reaproveitam esse mestre. Sem mestre, o painel de sessões mostra "sem acesso…".
-  Com o agente SSH do Omarchy (`omarchy-setup-security-ssh-agent`, gcr-ssh-agent com a senha no chaveiro) isso some.
+  A chave do `vps-r1` tem senha. Desde 2026-11-13 o agente SSH do Omarchy está ligado (`omarchy-setup-security-ssh-agent`,
+  gcr-ssh-agent): na primeira conexão o gcr abre uma janela pedindo a senha, que pode ficar no chaveiro, e depois nada é pedido.
+  Sem agente, o primeiro chat pede a senha **no terminal dele**, e as consultas em segundo plano (`BatchMode=yes`) reaproveitam
+  esse mestre; sem mestre nem agente, o painel de sessões mostra "sem acesso…".
 - Painel de sessões, aba do host: os tmux abertos lá (`tmux list-sessions`, clicar entra neles: `Chat::attach`, gravado como
   `tmux:<nome>`) e as últimas 150 sessões salvas do Claude Code de lá, lidas com `grep -o` (pasta e títulos, sem trazer o histórico).
 - Testado: o script remoto num tmux local isolado (`TMUX_TMPDIR`): opções aplicadas, argumentos com espaço preservados,
