@@ -253,8 +253,16 @@ Para trazer novidades do upstream, compare com o cosmic-term e reaplique só ess
 - **Fechar o chat só desconecta** (SIGHUP no `ssh`, o tmux continua). O botão `` (parar) do cabeçalho mata o tmux
   (`tmux kill-session`). Rede caída fecha o `ssh` (`ServerAliveInterval=15`, 4 tentativas): o chat fica "conexão encerrada"
   e "reconectar" volta ao mesmo tmux. O nome do tmux é gravado na lista de chats e reaproveitado ao reabrir o Chube.
-- Status: sem `~/.claude/sessions` lá, vem do título (`claude::status_from_title`): `✳` pronto, spinner trabalhando.
-  "precisa de você" não é detectado; contexto e modelo não aparecem ("na VPS"). O seletor de modo fica escondido.
+- Estado (`remote::poll`, `App::poll_remote`): a cada `REMOTE_POLL_EVERY` (3 s), uma consulta por host lê, para cada tmux de
+  chat do Claude, o `~/.claude/sessions/<pid>.json` de lá (o `claude` é o processo do painel ou um filho dele: `tmux
+  display-message '#{pane_pid}'` + `pgrep -P`) e a última resposta do `.jsonl` da sessão (`grep -o` do `model` e do começo
+  do `usage`). Traz id da sessão (sub-chat, `/clear`), status com "precisa de você", modelo e contexto, como nos locais; a
+  janela de contexto do modelo vem do `/context` daqui. Só roda com a conexão mestre aberta (`ssh -O check`): sem ela, não
+  consulta, para uma chave trancada no agente SSH não abrir a janela de senha a cada 3 s.
+- O título (`claude::status_from_title`: `✳` pronto, spinner trabalhando) dá a resposta rápida entre as consultas, sem
+  desfazer o "precisa de você". Títulos sem esse símbolo (o hostname que o tmux manda antes do agente) não viram o título do chat.
+- O seletor de modo vale também na VPS: lê o rodapé da TUI na tela e manda Shift+Tab, que passam pelo tmux (menos nos
+  chats que só entram num tmux de fora, que podem estar num shell).
 - SSH: todas as conexões usam `ControlMaster=auto`, `ControlPath=$XDG_RUNTIME_DIR/chube-ssh-%C` e `ControlPersist=15m`.
   A chave do `vps-r1` tem senha. Desde 2026-11-13 o agente SSH do Omarchy está ligado (`omarchy-setup-security-ssh-agent`,
   gcr-ssh-agent): na primeira conexão o gcr abre uma janela pedindo a senha, que pode ficar no chaveiro, e depois nada é pedido.
@@ -263,8 +271,10 @@ Para trazer novidades do upstream, compare com o cosmic-term e reaplique só ess
 - Painel de sessões, aba do host: os tmux abertos lá (`tmux list-sessions`, clicar entra neles: `Chat::attach`, gravado como
   `tmux:<nome>`) e as últimas 150 sessões salvas do Claude Code de lá, lidas com `grep -o` (pasta e títulos, sem trazer o histórico).
 - Testado: o script remoto num tmux local isolado (`TMUX_TMPDIR`): opções aplicadas, argumentos com espaço preservados,
-  o tmux sobrevive ao SIGHUP e os títulos `✳`/spinner chegam ao terminal de fora. **Não testado contra a VPS de verdade**
-  (precisa da senha da chave): `claude` no PATH de lá, primeira conexão, lista remota, `kill`, reconectar.
+  o tmux sobrevive ao SIGHUP e os títulos `✳`/spinner chegam ao terminal de fora. O script de estado, com um `claude` real
+  num tmux local montado como o da VPS, achou o processo e leu id e status; o `grep` do histórico, sobre um `.jsonl` real,
+  deu modelo e tokens. **Não testado contra a VPS de verdade**: `claude` no PATH de lá, primeira conexão, lista remota,
+  estado, `kill`, reconectar.
 
 ## Convenções
 
@@ -333,7 +343,7 @@ digitação nos terminais, fechar chat.
 Limitações conhecidas:
 - o status só vem de `~/.claude/sessions`, um arquivo interno do Claude Code (formato pode mudar);
 - o terminal não tem menu de contexto, zoom, busca nem divisão em painéis (o cosmic-term tem);
-- chats da VPS: sem "precisa de você", contexto e modelo; o título inicial é o do painel do tmux (o hostname) até o agente pôr o dele;
+- chats da VPS: o estado depende da conexão mestre e chega com até 3 s de atraso; Codex na VPS só tem o status pelo título;
 - a leitura do `/usage` depende do texto do Claude Code.
 
 

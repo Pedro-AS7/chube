@@ -186,6 +186,103 @@ pub async fn kill(host: String, tmux: String) -> Result<(), String> {
     run(&host, &format!("tmux kill-session -t {}", quote(&tmux))).await.map(|_| ())
 }
 
+/// Estado de um chat da VPS, lido lá: o que o `~/.claude/sessions/<pid>.json` do `claude` do tmux
+/// diz (id e status) e a última resposta do histórico (modelo e contexto).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RemoteStatus {
+    pub tmux: String,
+    pub session_id: Option<String>,
+    /// `busy`, `idle` ou `waiting`, como nesta máquina.
+    pub status: Option<String>,
+    pub model: Option<String>,
+    pub context_tokens: u32,
+}
+
+/// Lê o estado dos chats do Claude Code nos tmux `names` da VPS, numa consulta só.
+///
+/// Só usa uma conexão mestre que já existe (a do terminal do chat): sem ela, não faz nada, para
+/// uma chave trancada no agente SSH não abrir a janela de senha a cada poucos segundos.
+pub async fn poll(host: String, names: Vec<String>) -> Result<Vec<RemoteStatus>, String> {
+    let mut check = tokio::process::Command::new("ssh");
+    check.args(["-O", "check"]).args(ssh_options()).args(["--", &host]);
+    let master = check
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .status();
+    match tokio::time::timeout(Duration::from_secs(3), master).await {
+        Ok(Ok(status)) if status.success() => {}
+        _ => return Err("sem conexão aberta".into()),
+    }
+    let text = run(&host, &poll_script(&names)).await?;
+    Ok(parse_poll(&text))
+}
+
+/// Para cada tmux: o `claude` é o processo do painel ou um filho dele (no chat do Chube, o `env`
+/// que roda o `claude` é filho do `bash -lc`; num tmux de fora, o `claude` é filho do shell).
+fn poll_script(names: &[String]) -> String {
+    const FUNCTION: &str = r#"chube_poll() {
+  t=$1; sid=; st=; l=
+  pp=$(tmux display-message -p -t "$t" '#{pane_pid}' 2>/dev/null) || return 0
+  f=
+  for p in $pp $(pgrep -P "$pp" 2>/dev/null); do
+    [ -f "$HOME/.claude/sessions/$p.json" ] && { f="$HOME/.claude/sessions/$p.json"; break; }
+  done
+  if [ -n "$f" ]; then
+    sid=$(grep -o '"sessionId":"[^"]*"' "$f" | head -n 1 | cut -d '"' -f 4)
+    st=$(grep -o '"status":"[^"]*"' "$f" | head -n 1 | cut -d '"' -f 4)
+  fi
+  if [ -n "$sid" ]; then
+    jf=$(ls "$HOME"/.claude/projects/*/"$sid".jsonl 2>/dev/null | head -n 1)
+    [ -n "$jf" ] && l=$(tail -c 524288 "$jf" | grep '"type":"assistant"' | grep -v '"isSidechain":true' | tail -n 1)
+  fi
+  m=$(printf '%s' "$l" | grep -o '"model":"[^"]*"' | head -n 1 | cut -d '"' -f 4)
+  u=$(printf '%s' "$l" | grep -o '"usage":{[^}]*' | head -n 1)
+  printf 'C	%s	%s	%s	%s	%s
+' "$t" "$sid" "$st" "$m" "$u"
+}
+"#;
+    let calls: Vec<String> = names.iter().map(|name| format!("chube_poll {}", quote(name))).collect();
+    format!("{FUNCTION}{}
+", calls.join("
+"))
+}
+
+fn parse_poll(text: &str) -> Vec<RemoteStatus> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("C\t"))
+        .filter_map(|rest| {
+            let fields: Vec<&str> = rest.splitn(5, '\t').collect();
+            let field = |index: usize| fields.get(index).map(|value| value.trim()).filter(|value| !value.is_empty());
+            Some(RemoteStatus {
+                tmux: field(0)?.to_owned(),
+                session_id: field(1).map(str::to_owned),
+                status: field(2).map(str::to_owned),
+                model: field(3).map(str::to_owned),
+                context_tokens: field(4).map_or(0, usage_tokens),
+            })
+        })
+        .collect()
+}
+
+/// Tokens de contexto no começo do `usage` cortado pelo `grep -o` (até o primeiro `}`, o de um
+/// objeto aninhado): a entrada, a criação e a leitura do cache, como nesta máquina.
+fn usage_tokens(usage: &str) -> u32 {
+    let body = usage.strip_prefix("\"usage\":{").unwrap_or(usage);
+    body.split(',')
+        .filter_map(|pair| pair.split_once(':'))
+        .filter(|(key, _)| {
+            matches!(
+                key.trim().trim_matches('"'),
+                "input_tokens" | "cache_creation_input_tokens" | "cache_read_input_tokens"
+            )
+        })
+        .filter_map(|(_, value)| value.trim().parse::<u64>().ok())
+        .sum::<u64>()
+        .min(u64::from(u32::MAX)) as u32
+}
+
 /// Sessão do tmux aberta na VPS.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TmuxSession {
@@ -362,5 +459,27 @@ F\t1794617000\toutro/sem-titulo.jsonl\n\
         assert_eq!(saved.cwd, PathBuf::from("~/projects/x"));
         assert_eq!(saved.title, "Meu título");
         assert_eq!(saved.host.as_deref(), Some("vps-r1"));
+    }
+
+    #[test]
+    fn estado_dos_chats_da_vps() {
+        let text = "lixo\n\
+C\tchube-1\tabc\twaiting\tclaude-opus-5-5\t\"usage\":{\"input_tokens\":3,\"cache_creation_input_tokens\":1000,\"cache_read_input_tokens\":80000,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0\n\
+C\tcelular\t\t\t\t\n";
+        let list = parse_poll(text);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].tmux, "chube-1");
+        assert_eq!(list[0].session_id.as_deref(), Some("abc"));
+        assert_eq!(list[0].status.as_deref(), Some("waiting"));
+        assert_eq!(list[0].model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(list[0].context_tokens, 81_003);
+        assert_eq!(list[1], RemoteStatus { tmux: "celular".into(), ..Default::default() });
+    }
+
+    #[test]
+    fn script_de_estado_com_nomes_entre_aspas() {
+        let script = poll_script(&["chube-1".into(), "do celular".into()]);
+        assert!(script.starts_with("chube_poll() {"));
+        assert!(script.ends_with("chube_poll chube-1\nchube_poll 'do celular'\n"));
     }
 }

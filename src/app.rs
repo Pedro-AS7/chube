@@ -21,7 +21,7 @@ use crate::claude::{self, Mode, Start};
 use crate::commands::{self, Command};
 use crate::dirs;
 use crate::omarchy;
-use crate::remote::{self, Listing};
+use crate::remote::{self, Listing, RemoteStatus};
 use crate::restore::{self, OpenChat, OpenChats};
 use crate::sessions::{self, Running, SavedSession, Stats};
 use crate::shortcuts::{self, Shortcut};
@@ -32,6 +32,8 @@ use crate::usage::{self, Limit, Window};
 /// Intervalo de atualização automática do painel de uso. Os limites vêm do arquivo que o
 /// Omarchy atualiza; só sem ele o Chube roda o `/usage`.
 const REFRESH_EVERY: Duration = Duration::from_secs(120);
+/// Intervalo da leitura do estado dos chats da VPS (uma consulta por host, pela conexão aberta).
+const REMOTE_POLL_EVERY: Duration = Duration::from_secs(3);
 /// Intervalo da conferência do tema do Omarchy (o Chube muda junto com `omarchy theme set`).
 const THEME_CHECK_EVERY: Duration = Duration::from_secs(2);
 /// Intervalo da leitura do status das sessões (`~/.claude/sessions`).
@@ -145,6 +147,8 @@ pub enum Message {
     CommandsLoaded(term::TabId, Vec<Command>),
     Poll,
     Polled(Vec<Polled>),
+    /// Estado dos chats de um host da VPS.
+    RemotePolled(String, Result<Vec<RemoteStatus>, String>),
     OpenLink(String),
     RefreshInfo,
     /// Limites do Claude (do Omarchy ou do `/usage`), os do Codex (do Omarchy) e a hora da
@@ -204,6 +208,9 @@ pub struct App {
     /// Id da rolagem horizontal das abas do terminal.
     terminal_tabs_id: widget::Id,
     polling: bool,
+    /// Hosts com uma leitura de estado em andamento, e a hora da última leitura.
+    remote_polling: HashSet<String>,
+    remote_polled: Option<std::time::Instant>,
     panes: pane_grid::State<Section>,
     sidebar_visible: bool,
     chat_visible: bool,
@@ -293,6 +300,8 @@ impl Application for App {
             tab_terminal_id: widget::Id::unique(),
             terminal_tabs_id: widget::Id::unique(),
             polling: false,
+            remote_polling: HashSet::new(),
+            remote_polled: None,
             panes: pane_grid::State::new(Section::Chat).0,
             sidebar_visible: true,
             chat_visible: true,
@@ -770,11 +779,19 @@ impl App {
                     chat.send(bytes);
                 }
             }
-            Message::Poll => return self.poll(),
+            Message::Poll => return Task::batch([self.poll(), self.poll_remote()]),
             Message::Polled(list) => {
                 self.polling = false;
                 self.apply_poll(list);
                 return self.fetch_context_window();
+            }
+            Message::RemotePolled(host, result) => {
+                self.remote_polling.remove(&host);
+                // Sem conexão aberta ou erro na consulta: fica o status vindo do título.
+                if let Ok(list) = result {
+                    self.apply_remote_poll(&host, list);
+                    return self.fetch_context_window();
+                }
             }
             Message::OpenLink(url) => {
                 let _ = std::process::Command::new("xdg-open").arg(url).spawn();
@@ -1300,6 +1317,60 @@ impl App {
         })
     }
 
+    /// Lê o estado dos chats do Claude Code da VPS (status, id da sessão, modelo e contexto), uma
+    /// consulta por host a cada `REMOTE_POLL_EVERY`.
+    fn poll_remote(&mut self) -> Task<Message> {
+        if self.remote_polled.is_some_and(|time| time.elapsed() < REMOTE_POLL_EVERY) {
+            return Task::none();
+        }
+        let mut by_host: HashMap<String, Vec<String>> = HashMap::new();
+        for chat in self.chats.iter().filter(|chat| chat.is_alive() && chat.agent == Agent::Claude) {
+            if let (Some(host), Some(tmux)) = (&chat.host, &chat.tmux) {
+                if chat.terminal.is_some() && !self.remote_polling.contains(host) {
+                    by_host.entry(host.clone()).or_default().push(tmux.clone());
+                }
+            }
+        }
+        if by_host.is_empty() {
+            return Task::none();
+        }
+        self.remote_polled = Some(std::time::Instant::now());
+        let tasks = by_host.into_iter().map(|(host, names)| {
+            self.remote_polling.insert(host.clone());
+            cosmic::task::future(async move {
+                let result = remote::poll(host.clone(), names).await;
+                Message::RemotePolled(host, result)
+            })
+        });
+        Task::batch(tasks.collect::<Vec<_>>())
+    }
+
+    fn apply_remote_poll(&mut self, host: &str, list: Vec<RemoteStatus>) {
+        for polled in list {
+            let Some(chat) = self.chats.iter_mut().find(|chat| {
+                chat.is_alive() && chat.host.as_deref() == Some(host) && chat.tmux.as_deref() == Some(polled.tmux.as_str())
+            }) else {
+                continue;
+            };
+            if let Some(session_id) = polled.session_id {
+                // `/clear` troca a sessão (o contexto zera); num sub-chat, o id aparece aqui.
+                if chat.session_id.as_ref().is_some_and(|id| *id != session_id) {
+                    chat.context_tokens = 0;
+                }
+                chat.session_id = Some(session_id);
+            }
+            if let Some(status) = polled.status.as_deref().and_then(Status::from_claude) {
+                chat.status = status;
+            }
+            if polled.model.is_some() {
+                chat.active_model = polled.model;
+            }
+            if polled.context_tokens > 0 {
+                chat.context_tokens = polled.context_tokens;
+            }
+        }
+    }
+
     fn apply_poll(&mut self, list: Vec<Polled>) {
         for chat in self.chats.iter_mut().filter(|chat| chat.is_alive()) {
             chat.read_mode();
@@ -1409,14 +1480,21 @@ impl App {
         if let Some(chat) = self.chats.iter_mut().find(|chat| chat.id == id) {
             match event {
                 term::Event::Title(title) if chat.host.is_some() => {
-                    // Na VPS, o título do agente (repassado pelo tmux) dá o assunto e o status.
-                    if let Some(status) = claude::status_from_title(&title) {
-                        chat.status = status;
-                    } else if chat.status == Status::Starting {
-                        chat.status = Status::Ready;
+                    // Na VPS, o título do agente (repassado pelo tmux) dá o assunto e uma resposta
+                    // rápida do status; a leitura periódica (`poll_remote`) traz o "precisa de você",
+                    // que o título não mostra e que ele não desfaz.
+                    match claude::status_from_title(&title) {
+                        Some(Status::Working) => chat.status = Status::Working,
+                        Some(status) if chat.status != Status::Waiting => chat.status = status,
+                        Some(_) => {}
+                        None if chat.status == Status::Starting => chat.status = Status::Ready,
+                        None => {}
                     }
-                    if let Some(title) = claude::title_from_terminal(&title) {
-                        chat.title = short_title(&title);
+                    // Antes do agente pôr o título dele, o tmux manda o do painel (o hostname).
+                    if claude::status_from_title(&title).is_some() {
+                        if let Some(title) = claude::title_from_terminal(&title) {
+                            chat.title = short_title(&title);
+                        }
                     }
                 }
                 term::Event::Title(title) => {
@@ -1570,7 +1648,6 @@ impl App {
         let space = theme::spacing();
         let palette = themes::current();
         let focused = self.chats.get(self.focused);
-        let remote = focused.is_some_and(|chat| chat.host.is_some());
         let context_tokens = focused.map_or(0, |chat| chat.context_tokens);
         let is_codex = focused.is_some_and(|chat| chat.agent == Agent::Codex);
         let limits: &[Limit] = if is_codex {
@@ -1601,9 +1678,7 @@ impl App {
             ))
             .align_y(Alignment::Center);
 
-        let context = if remote {
-            meter("contexto", None, Some("na VPS".into()), None)
-        } else if context_tokens == 0 || (is_codex && known_window.is_none()) {
+        let context = if context_tokens == 0 || (is_codex && known_window.is_none()) {
             meter("contexto", None, None, None)
         } else {
             // Enquanto o `/context` não responde, chuta 200 mil; acima disso, só pode ser 1 milhão
@@ -1729,7 +1804,8 @@ impl App {
                 .width(Length::Fill)
                 .clip(true),
         );
-        if chat.is_alive() && chat.agent == Agent::Claude && chat.host.is_none() {
+        // Também na VPS: o modo é lido no rodapé da TUI e trocado com Shift+Tab, pelo tmux.
+        if chat.is_alive() && chat.agent == Agent::Claude && !chat.attach_only {
             second = second.push(self.mode_selector(chat.mode));
         }
         let header = widget::Column::new()
