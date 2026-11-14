@@ -12,10 +12,11 @@ use async_channel::Sender;
 use gtk4::prelude::*;
 use gtk4::{gdk, glib, pango};
 
-use crate::app::{self, App, Focus, Message, Section};
+use crate::app::{self, App, Focus, Message, Panel, Section};
 use crate::chat::{Chat, Status, TermId};
 use crate::claude;
 use crate::groups::Category;
+use crate::panels::{NewChatPanel, SessionsPanel};
 use crate::shortcuts;
 use crate::themes;
 
@@ -25,9 +26,11 @@ const ICON_HIDE_LEFT: &str = "\u{f053}";
 const ICON_HIDE_RIGHT: &str = "\u{f054}";
 const ICON_TERMINAL: &str = "\u{f489}";
 const ICON_CLOSE: &str = "\u{f0156}";
-const ICON_SERVER: &str = "\u{f048b}";
-const ICON_LAPTOP: &str = "\u{f0322}";
-const ICON_OMARCHY: &str = "\u{f303}";
+pub const ICON_SERVER: &str = "\u{f048b}";
+pub const ICON_LAPTOP: &str = "\u{f0322}";
+pub const ICON_OMARCHY: &str = "\u{f303}";
+const ICON_HISTORY: &str = "\u{f02da}";
+const ICON_FORK: &str = "\u{e725}";
 const ICON_CHATS: &str = "\u{f0b79}";
 const ICON_EXITED: &str = "\u{f057}";
 const ICON_HELP: &str = "\u{f059}";
@@ -42,6 +45,7 @@ macro_rules! row {
         row
     }};
 }
+pub(crate) use row;
 
 pub struct Ui {
     window: gtk4::ApplicationWindow,
@@ -59,6 +63,10 @@ pub struct Ui {
     chat_title: gtk4::Label,
     chat_details: gtk4::Label,
     reopen: gtk4::Button,
+    fork: gtk4::Button,
+    close_panel: gtk4::Button,
+    new_chat: NewChatPanel,
+    sessions: SessionsPanel,
     close_chat: gtk4::Button,
     show_terminal: gtk4::Button,
     notice: gtk4::Label,
@@ -73,7 +81,7 @@ pub struct Ui {
 }
 
 impl Ui {
-    pub fn new(application: &gtk4::Application, tx: Sender<Message>) -> Self {
+    pub fn new(application: &gtk4::Application, app: &App, tx: Sender<Message>) -> Self {
         let css = gtk4::CssProvider::new();
         if let Some(display) = gdk::Display::default() {
             gtk4::style_context_add_provider_for_display(&display, &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -82,13 +90,14 @@ impl Ui {
 
         // Lista de chats.
         let chats_count = label("", &["dim"]);
-        let new_chat = icon_button(ICON_NEW, "Nova sessão na pasta do chat em foco (Ctrl+Shift+N)", &tx, || Message::NewChat);
+        let new_chat = icon_button(ICON_NEW, "Nova sessão (Ctrl+Shift+N)", &tx, || Message::NewChat);
+        let show_sessions = icon_button(ICON_HISTORY, "Sessões salvas", &tx, || Message::ShowSessions);
         let hide_sidebar = icon_button(ICON_HIDE_LEFT, "Esconder o painel (Ctrl+Shift+1)", &tx, || {
             Message::HideSection(Section::Sidebar)
         });
         let help = label(ICON_HELP, &["dim", "icon-label"]);
         help.set_tooltip_text(Some(&shortcuts_help()));
-        let header = row!(&heading(ICON_CHATS, "chats"), &chats_count, &fill(), &new_chat, &help, &hide_sidebar);
+        let header = row!(&heading(ICON_CHATS, "chats"), &chats_count, &fill(), &new_chat, &show_sessions, &help, &hide_sidebar);
         let list = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
         let scroll = gtk4::ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -109,12 +118,14 @@ impl Ui {
         let chat_details = label("", &["dim"]);
         chat_details.set_ellipsize(pango::EllipsizeMode::Middle);
         let reopen = text_button("reabrir", "Retomar ou reiniciar esta sessão", &tx, || Message::ReopenChat);
+        let fork = icon_button(ICON_FORK, "Criar sub-chat com o contexto deste chat", &tx, || Message::SubChat);
+        let close_panel = icon_button(ICON_CLOSE, "Voltar ao chat (Esc)", &tx, || Message::ClosePanel);
         let close_chat = gtk4::Button::with_label(ICON_CLOSE);
         close_chat.add_css_class("icon");
         let show_terminal = icon_button(ICON_HIDE_LEFT, "Mostrar o terminal (Ctrl+Shift+3)", &tx, || {
             Message::ShowSection(Section::Terminal)
         });
-        let title_line = row!(&chat_glyph, &chat_title, &reopen, &close_chat, &show_terminal);
+        let title_line = row!(&chat_glyph, &chat_title, &reopen, &fork, &close_chat, &close_panel, &show_terminal);
         let titles = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         titles.set_hexpand(true);
         titles.append(&title_line);
@@ -178,6 +189,10 @@ impl Ui {
             .child(&outer)
             .build();
         window.add_css_class("chube");
+        let new_chat_panel = NewChatPanel::new(app, &window, &tx);
+        let sessions_panel = SessionsPanel::new(app, &tx);
+        chat_stack.add_named(&new_chat_panel.root, Some("nova"));
+        chat_stack.add_named(&sessions_panel.root, Some("sessoes"));
 
         // Atalhos na fase de captura: chegam antes do terminal em foco e não vão para o PTY.
         let keys = gtk4::EventControllerKey::new();
@@ -207,6 +222,10 @@ impl Ui {
             chat_title,
             chat_details,
             reopen,
+            fork,
+            close_panel,
+            new_chat: new_chat_panel,
+            sessions: sessions_panel,
             close_chat,
             show_terminal,
             notice,
@@ -251,6 +270,13 @@ impl Ui {
 
         if let Some(focus) = app.focus.take() {
             let target = match focus {
+                Focus::NewChatInput => {
+                    let entry = self.new_chat.entry.clone();
+                    glib::idle_add_local_once(move || {
+                        entry.grab_focus();
+                    });
+                    None
+                }
                 Focus::Chat if app.chat_visible => app.chats.get(app.focused).and_then(|chat| chat.terminal.clone()),
                 _ => app.active_tab.and_then(|id| app.tabs.iter().find(|tab| tab.id == id)).map(|tab| tab.terminal.clone()),
             };
@@ -347,25 +373,17 @@ impl Ui {
         let second = row!(&label(&format!("  {agent} · "), &["dim"]), &label(chat.status.label(), &[status_class]));
 
         let item = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        item.add_css_class("chat-row");
         if index == app.focused {
             item.add_css_class("selected");
         }
-        item.set_margin_start(12);
         item.append(&first);
         item.append(&second);
-        let click = gtk4::GestureClick::new();
-        let sender = self.tx.clone();
-        click.connect_released(move |gesture, _, _, _| {
-            gesture.set_state(gtk4::EventSequenceState::Claimed);
-            let _ = sender.try_send(Message::SelectChat(index));
-        });
-        item.add_controller(click);
-        item.set_cursor_from_name(Some("pointer"));
-        item
+        let row = clickable_row(&item, &self.tx, move || Message::SelectChat(index));
+        row.set_margin_start(12);
+        row
     }
 
-    fn sync_chat(&self, app: &App) {
+    fn sync_chat(&self, app: &mut App) {
         // Páginas novas; as dos chats que saíram da lista vão embora (o terminal junto).
         let live: HashSet<TermId> = app.chats.iter().filter(|chat| chat.terminal.is_some()).map(|chat| chat.id).collect();
         for chat in app.chats.iter().filter(|chat| !self.chat_pages.borrow().contains(&chat.id)) {
@@ -382,9 +400,36 @@ impl Ui {
             self.chat_pages.borrow_mut().remove(&id);
         }
 
+        match app.panel {
+            Panel::NewChat => self.new_chat.sync(app),
+            Panel::Sessions => self.sessions.sync(app, &self.tx),
+            Panel::None => {}
+        }
         let chat = app.chats.get(app.focused);
-        let page = chat.filter(|chat| chat.terminal.is_some()).map_or_else(|| "vazio".to_owned(), |chat| page_name(chat.id));
+        let page = match app.panel {
+            Panel::NewChat => "nova".to_owned(),
+            Panel::Sessions => "sessoes".to_owned(),
+            Panel::None => chat.filter(|chat| chat.terminal.is_some()).map_or_else(|| "vazio".to_owned(), |chat| page_name(chat.id)),
+        };
         self.chat_stack.set_visible_child_name(&page);
+        self.close_panel.set_visible(app.panel != Panel::None);
+        let panel_title = match app.panel {
+            Panel::NewChat => Some((ICON_NEW, "nova sessão")),
+            Panel::Sessions => Some((ICON_HISTORY, "sessões")),
+            Panel::None => None,
+        };
+        if let Some((icon, title)) = panel_title {
+            self.chat_glyph.set_text(&format!("{icon} "));
+            self.chat_glyph.set_css_classes(&["accent"]);
+            self.chat_title.set_text(title);
+            self.chat_details.set_text("Esc volta ao chat");
+            self.reopen.set_visible(false);
+            self.fork.set_visible(false);
+            self.close_chat.set_visible(false);
+            self.notice.set_visible(app.notice.is_some());
+            self.notice.set_text(app.notice.as_deref().unwrap_or_default());
+            return;
+        }
 
         match chat {
             Some(chat) => {
@@ -394,6 +439,9 @@ impl Ui {
                 self.chat_title.set_text(&chat.title);
                 self.chat_details.set_text(&chat_details(chat));
                 self.reopen.set_visible(chat.status == Status::Exited);
+                let can_fork = chat.session_id.is_some() && chat.status != Status::Starting && !chat.attach_only;
+                self.fork.set_visible(true);
+                self.fork.set_sensitive(can_fork);
                 self.close_chat.set_visible(true);
                 self.close_chat.set_widget_name(&app.focused.to_string());
                 self.close_chat.set_tooltip_text(Some(close_tip(chat)));
@@ -403,6 +451,7 @@ impl Ui {
                 self.chat_title.set_text("C-hub");
                 self.chat_details.set_text("");
                 self.reopen.set_visible(false);
+                self.fork.set_visible(false);
                 self.close_chat.set_visible(false);
             }
         }
@@ -497,7 +546,7 @@ fn close_tip(chat: &Chat) -> &'static str {
 }
 
 /// Ícone e classe de cor de cada status, com as cores do tema do Omarchy.
-fn status_glyph(status: Status) -> (&'static str, &'static str) {
+pub fn status_glyph(status: Status) -> (&'static str, &'static str) {
     match status {
         Status::Suspended => ("\u{f04c}", "dim"),
         Status::Starting => ("\u{f10c}", "dim"),
@@ -516,7 +565,7 @@ fn shortcuts_help() -> String {
         .join("\n")
 }
 
-fn label(text: &str, classes: &[&str]) -> gtk4::Label {
+pub fn label(text: &str, classes: &[&str]) -> gtk4::Label {
     let label = gtk4::Label::new(Some(text));
     label.set_xalign(0.0);
     for class in classes {
@@ -566,8 +615,38 @@ fn icon_button(icon: &str, help: &str, tx: &Sender<Message>, message: impl Fn() 
     button
 }
 
+/// Linha clicável, como as dos menus do Omarchy: ao passar o mouse, um fundo do texto a 8%.
+pub fn clickable_row(content: &gtk4::Box, tx: &Sender<Message>, message: impl Fn() -> Message + 'static) -> gtk4::Box {
+    content.add_css_class("chat-row");
+    let click = gtk4::GestureClick::new();
+    let sender = tx.clone();
+    click.connect_released(move |gesture, _, _, _| {
+        gesture.set_state(gtk4::EventSequenceState::Claimed);
+        let _ = sender.try_send(message());
+    });
+    content.add_controller(click);
+    content.set_cursor_from_name(Some("pointer"));
+    content.clone()
+}
+
+/// Opção de um grupo (agente, lugar): a escolhida com o texto no acento e a borda da seleção.
+pub fn choice(text: &str, tx: &Sender<Message>, message: impl Fn() -> Message + 'static) -> gtk4::Button {
+    let button = gtk4::Button::with_label(text);
+    button.add_css_class("choice");
+    button_message(&button, tx, message);
+    button
+}
+
+/// Manda a mensagem a cada clique.
+pub fn button_message(button: &gtk4::Button, tx: &Sender<Message>, message: impl Fn() -> Message + 'static) {
+    let sender = tx.clone();
+    button.connect_clicked(move |_| {
+        let _ = sender.try_send(message());
+    });
+}
+
 /// Botão de texto com borda, como os controles do shell do Omarchy.
-fn text_button(text: &str, help: &str, tx: &Sender<Message>, message: impl Fn() -> Message + 'static) -> gtk4::Button {
+pub fn text_button(text: &str, help: &str, tx: &Sender<Message>, message: impl Fn() -> Message + 'static) -> gtk4::Button {
     let button = gtk4::Button::with_label(text);
     button.add_css_class("text");
     button.set_tooltip_text(Some(help));
@@ -616,6 +695,15 @@ tooltip {{ background: {tooltip}; color: {fg}; border: 1px solid {fg}; }}
 tooltip label {{ font-family: '{family}'; }}
 vte-terminal, vte-terminal.view, scrolledwindow, viewport, stack {{ background: transparent; }}
 vte-terminal {{ padding: 2px 4px; }}
+.panel {{ padding: 8px; }}
+button.choice {{ background: none; border: 1px solid transparent; box-shadow: none; padding: 2px 8px; min-height: 0; color: {fg}; }}
+button.choice:hover {{ background: {hover}; }}
+button.choice.selected {{ background: {hover}; border-color: {select_border}; color: {accent}; }}
+flowboxchild {{ padding: 0; }}
+entry {{ background: {button}; border: 1px solid {button_border}; box-shadow: none; color: {fg}; padding: 2px 6px; min-height: 0; }}
+entry:focus-within {{ border-color: {accent}; outline: none; }}
+.blocked {{ opacity: 0.45; }}
+button:disabled {{ opacity: 0.4; }}
 .section-header button {{ margin-left: 2px; }}
 ",
         window = palette.window().css(),

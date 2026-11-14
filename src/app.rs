@@ -5,7 +5,7 @@
 //! de nova sessão, as sessões salvas, a VPS e o uso, está na branch `omarchy`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -19,10 +19,12 @@ use crate::chat::{Chat, Status, TMUX_ID_PREFIX, TermId};
 use crate::claude::{self, Start};
 use crate::cli::{self, Flags};
 use crate::codex;
+use crate::dirs;
 use crate::groups::{self, Category, CategoryGroup};
 use crate::omarchy;
+use crate::remote::{self, Listing};
 use crate::restore::{self, OpenChat, OpenChats};
-use crate::sessions::{self, Running, Stats};
+use crate::sessions::{self, Running, SavedSession, Stats};
 use crate::shortcuts::Shortcut;
 use crate::task::{self, Task};
 use crate::terminal;
@@ -36,6 +38,31 @@ const THEME_CHECK_EVERY: Duration = Duration::from_secs(2);
 const POLL_EVERY: Duration = Duration::from_secs(1);
 const TITLE_MAX_CHARS: usize = 40;
 
+/// O que abrir num chat novo: o agente padrão do Omarchy no modo do `omarchy agent`, ou um
+/// agente escolhido, no modo dele.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Launch {
+    Omarchy,
+    Claude,
+    Codex,
+}
+
+/// Painel mostrado no lugar do terminal do chat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Panel {
+    None,
+    NewChat,
+    Sessions,
+}
+
+/// Sessões de uma VPS, buscadas por SSH.
+#[derive(Clone, Debug)]
+pub enum RemoteState {
+    Loading,
+    Loaded(Listing),
+    Failed(String),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Sidebar,
@@ -48,9 +75,31 @@ pub enum Message {
     SelectChat(usize),
     CloseChat(usize),
     ReopenChat,
-    /// Chat novo na pasta do chat em foco, com o agente dele (o painel de nova sessão ainda não
-    /// foi portado).
+    /// Abre o painel de nova sessão.
     NewChat,
+    NewChatInput(String),
+    NewChatLaunch(Launch),
+    /// Onde rodar: esta máquina (`None`) ou um host do SSH.
+    NewChatHost(Option<String>),
+    NewChatConfirm,
+    /// Pasta escolhida no seletor de pastas (o diálogo é da interface).
+    NewChatPicked(Option<PathBuf>),
+    ClosePanel,
+    ShowSessions,
+    /// Sessões de qual lugar mostrar: esta máquina (`None`) ou um host do SSH.
+    SessionsHost(Option<String>),
+    SessionsLoaded(Vec<SavedSession>),
+    /// Recarrega as sessões do lugar mostrado.
+    ReloadSessions,
+    RemoteListed(String, Result<Listing, String>),
+    ToggleDirGroup(PathBuf),
+    ResumeSession(usize),
+    /// Retoma uma sessão salva da VPS (host, índice na lista dela).
+    ResumeRemote(String, usize),
+    /// Entra numa sessão do tmux aberta na VPS (host, índice na lista dela).
+    AttachTmux(String, usize),
+    /// Sub-chat: nova sessão com o contexto do chat em foco.
+    SubChat,
     OpenDirectories(Result<Flags, String>),
     Poll,
     Polled(Vec<Polled>),
@@ -96,6 +145,8 @@ pub struct Tab {
 pub enum Focus {
     Chat,
     Terminal,
+    /// O campo de pasta do painel de nova sessão.
+    NewChatInput,
 }
 
 pub struct App {
@@ -106,6 +157,26 @@ pub struct App {
     default_agent: Agent,
     /// `--agent omarchy` na linha de comando.
     default_auto: bool,
+    /// Agente padrão do Omarchy (`omarchy default agent`), se for o Claude Code ou o Codex.
+    pub omarchy_agent: Option<Agent>,
+    /// Hosts do `~/.ssh/config`, oferecidos como lugar dos chats.
+    pub hosts: Vec<String>,
+    pub panel: Panel,
+    pub new_chat_launch: Launch,
+    pub new_chat_host: Option<String>,
+    /// Pasta digitada no painel de nova sessão.
+    pub new_chat_input: String,
+    /// O texto do campo mudou por fora (painel aberto, pasta escolhida): a interface o copia.
+    pub new_chat_input_reset: bool,
+    /// Sessões salvas desta máquina; `None` enquanto carrega.
+    pub saved_sessions: Option<Vec<SavedSession>>,
+    /// Lugar mostrado no painel de sessões: esta máquina (`None`) ou um host do SSH.
+    pub sessions_host: Option<String>,
+    pub remote_sessions: HashMap<String, RemoteState>,
+    /// Pastas abertas na lista de sessões salvas.
+    pub expanded_dirs: HashSet<PathBuf>,
+    /// Muda a cada mudança no painel de sessões: a interface só o refaz quando ela muda.
+    pub sessions_version: u64,
     pub tabs: Vec<Tab>,
     pub active_tab: Option<TermId>,
     /// Numeração única dos terminais: abas e chats.
@@ -142,6 +213,18 @@ impl App {
             model: flags.model.clone(),
             default_agent: flags.agent,
             default_auto: flags.auto,
+            omarchy_agent: omarchy::default_agent().and_then(|name| Agent::parse(&name)),
+            hosts: remote::hosts(),
+            panel: Panel::None,
+            new_chat_launch: Launch::Claude,
+            new_chat_host: None,
+            new_chat_input: String::new(),
+            new_chat_input_reset: false,
+            saved_sessions: None,
+            sessions_host: None,
+            remote_sessions: HashMap::new(),
+            expanded_dirs: HashSet::new(),
+            sessions_version: 0,
             tabs: Vec::new(),
             active_tab: None,
             next_terminal_id: 0,
@@ -188,6 +271,7 @@ impl App {
         match message {
             Message::SelectChat(index) => {
                 self.notice = None;
+                self.panel = Panel::None;
                 if index < self.chats.len() {
                     self.focused = index;
                     self.focus = Some(Focus::Chat);
@@ -203,14 +287,144 @@ impl App {
                 }
             }
             Message::NewChat => {
-                let id = self.take_terminal_id();
-                let chat = match self.chats.get(self.focused) {
-                    Some(focused) => Chat::new(id, focused.agent, focused.cwd.clone(), self.new_model(focused.agent), None)
-                        .with_place(focused.auto, focused.host.clone()),
-                    None => Chat::new(id, self.default_agent, self.default_dir.clone(), self.model.clone(), None)
-                        .with_place(self.default_auto, None),
+                // Herda o agente e o lugar do chat em foco; sem chat, o padrão da linha de comando.
+                let (launch, host) = match self.chats.get(self.focused) {
+                    Some(chat) if chat.auto => (Launch::Omarchy, None),
+                    Some(chat) => (launch_of(chat.agent), chat.host.clone()),
+                    None if self.default_auto => (Launch::Omarchy, None),
+                    // Sem chat, o agente do Omarchy, se ele for um dos que o Chube abre.
+                    None if self.omarchy_agent.is_some() => (Launch::Omarchy, None),
+                    None => (launch_of(self.default_agent), None),
                 };
+                self.new_chat_launch = launch;
+                self.new_chat_host = host;
+                self.new_chat_input.clear();
+                self.new_chat_input_reset = true;
+                self.panel = Panel::NewChat;
+                self.chat_visible = true;
+                self.focus = Some(Focus::NewChatInput);
+            }
+            Message::NewChatInput(text) => self.new_chat_input = text,
+            Message::NewChatLaunch(launch) => {
+                // O agente do Omarchy só roda neste notebook.
+                if launch == Launch::Omarchy {
+                    self.new_chat_host = None;
+                }
+                self.new_chat_launch = launch;
+                self.focus = Some(Focus::NewChatInput);
+            }
+            Message::NewChatHost(host) => {
+                // Na VPS não há o agente do Omarchy: troca pelo agente que ele usaria.
+                if host.is_some() && self.new_chat_launch == Launch::Omarchy {
+                    self.new_chat_launch = launch_of(self.omarchy_agent.unwrap_or(self.default_agent));
+                }
+                self.new_chat_host = host;
+                self.focus = Some(Focus::NewChatInput);
+            }
+            Message::NewChatConfirm => {
+                let Some((agent, auto)) = self.launch_agent(self.new_chat_launch) else {
+                    return Task::none();
+                };
+                let folder = match &self.new_chat_host {
+                    // Na VPS, a pasta vai como foi digitada (o `~` é a home de lá).
+                    Some(_) => PathBuf::from(remote_dir(&self.new_chat_input)),
+                    None => match self.new_chat_dir() {
+                        Ok(folder) => folder,
+                        Err(_) => return Task::none(),
+                    },
+                };
+                self.panel = Panel::None;
+                let id = self.take_terminal_id();
+                let chat = Chat::new(id, agent, folder, self.new_model(agent), None)
+                    .with_place(auto, self.new_chat_host.clone());
                 self.open_chat(self.chats.len(), chat);
+            }
+            // A pasta escolhida vai para o campo, para ser conferida antes de criar.
+            Message::NewChatPicked(Some(folder)) => {
+                self.new_chat_input = folder.display().to_string();
+                self.new_chat_input_reset = true;
+                self.focus = Some(Focus::NewChatInput);
+            }
+            Message::NewChatPicked(None) => {}
+            Message::ClosePanel => {
+                self.panel = Panel::None;
+                self.focus = Some(Focus::Chat);
+            }
+            Message::ShowSessions => {
+                self.panel = Panel::Sessions;
+                self.chat_visible = true;
+                self.sessions_host = self.chats.get(self.focused).and_then(|chat| chat.host.clone());
+                self.expanded_dirs = HashSet::from([self.focused_local_dir()]);
+                return self.load_sessions();
+            }
+            Message::SessionsHost(host) => {
+                self.sessions_host = host;
+                return self.load_sessions();
+            }
+            Message::ReloadSessions => return self.load_sessions(),
+            Message::SessionsLoaded(list) => {
+                self.saved_sessions = Some(list);
+                self.sessions_version += 1;
+            }
+            Message::RemoteListed(host, result) => {
+                let state = match result {
+                    Ok(listing) => RemoteState::Loaded(listing),
+                    Err(error) => RemoteState::Failed(error),
+                };
+                self.remote_sessions.insert(host, state);
+                self.sessions_version += 1;
+            }
+            Message::ToggleDirGroup(dir) => {
+                if !self.expanded_dirs.remove(&dir) {
+                    self.expanded_dirs.insert(dir);
+                }
+                self.sessions_version += 1;
+            }
+            Message::ResumeSession(index) => {
+                let saved = self.saved_sessions.as_ref().and_then(|list| list.get(index)).cloned();
+                if let Some(saved) = saved {
+                    self.resume_saved(saved);
+                }
+            }
+            Message::ResumeRemote(host, index) => {
+                let saved = match self.remote_sessions.get(&host) {
+                    Some(RemoteState::Loaded(listing)) => listing.sessions.get(index).cloned(),
+                    _ => None,
+                };
+                if let Some(saved) = saved {
+                    self.resume_saved(saved);
+                }
+            }
+            Message::AttachTmux(host, index) => {
+                let tmux = match self.remote_sessions.get(&host) {
+                    Some(RemoteState::Loaded(listing)) => listing.tmux.get(index).cloned(),
+                    _ => None,
+                };
+                let Some(tmux) = tmux else {
+                    return Task::none();
+                };
+                self.panel = Panel::None;
+                if let Some(open) = self.chats.iter().position(|chat| {
+                    chat.host.as_deref() == Some(host.as_str()) && chat.tmux.as_deref() == Some(tmux.name.as_str())
+                }) {
+                    self.focused = open;
+                    self.focus = Some(Focus::Chat);
+                    // Encerrado (rede caída, por exemplo), volta a entrar no mesmo tmux.
+                    if !self.chats[open].is_alive() {
+                        return self.handle(Message::ReopenChat);
+                    }
+                    return Task::none();
+                }
+                let title = claude::title_from_terminal(&tmux.title).unwrap_or_else(|| tmux.name.clone());
+                let id = self.take_terminal_id();
+                let chat = Chat::attach(id, host, tmux.name, PathBuf::from(tmux.path), short_title(&title));
+                self.open_chat(self.chats.len(), chat);
+            }
+            Message::SubChat => {
+                let id = self.take_terminal_id();
+                if let Some(chat) = self.chats.get(self.focused).and_then(|chat| chat.fork(id)) {
+                    self.open_chat(self.focused + 1, chat);
+                }
             }
             Message::OpenDirectories(Ok(flags)) => self.open_directories(flags),
             Message::OpenDirectories(Err(error)) => self.notice = Some(error),
@@ -325,6 +539,88 @@ impl App {
         groups::group(&keys)
     }
 
+    fn launch_agent(&self, launch: Launch) -> Option<(Agent, bool)> {
+        match launch {
+            Launch::Omarchy => self.omarchy_agent.map(|agent| (agent, true)),
+            Launch::Claude => Some((Agent::Claude, false)),
+            Launch::Codex => Some((Agent::Codex, false)),
+        }
+    }
+
+    /// Pasta do chat novo nesta máquina. Vazio é a pasta do chat em foco ou, no modo do Omarchy,
+    /// a mesma do `omarchy agent` (`~/Work`).
+    pub fn new_chat_dir(&self) -> Result<PathBuf, String> {
+        if self.new_chat_input.trim().is_empty() {
+            return Ok(if self.new_chat_launch == Launch::Omarchy {
+                omarchy::work_dir()
+            } else {
+                self.focused_local_dir()
+            });
+        }
+        dirs::resolve(&self.new_chat_input, &self.focused_local_dir())
+    }
+
+    /// O que o painel de nova sessão vai abrir: o caminho (ou o erro) e se o agente pode abrir.
+    pub fn new_chat_preview(&self) -> Result<String, String> {
+        if self.launch_agent(self.new_chat_launch).is_none() {
+            return Err("o agente padrão do Omarchy não é o Claude Code nem o Codex".into());
+        }
+        match &self.new_chat_host {
+            Some(host) => Ok(format!("{host}:{}", remote_dir(&self.new_chat_input))),
+            None => self.new_chat_dir().map(|path| claude::display_path(&path)),
+        }
+    }
+
+    /// Pasta do chat em foco, se ele é desta máquina; senão a padrão.
+    fn focused_local_dir(&self) -> PathBuf {
+        match self.chats.get(self.focused) {
+            Some(chat) if chat.host.is_none() => chat.cwd.clone(),
+            _ => self.default_dir.clone(),
+        }
+    }
+
+    /// Carrega as sessões do lugar escolhido no painel (desta máquina ou da VPS).
+    fn load_sessions(&mut self) -> Task {
+        self.sessions_version += 1;
+        match self.sessions_host.clone() {
+            None => {
+                self.saved_sessions = None;
+                Task::blocking(|| {
+                    let mut list = sessions::list();
+                    list.extend(codex::list());
+                    list.sort_by(|a, b| b.modified.cmp(&a.modified));
+                    Message::SessionsLoaded(list)
+                })
+            }
+            Some(host) => {
+                self.remote_sessions.insert(host.clone(), RemoteState::Loading);
+                Task::future(async move {
+                    let result = remote::list(host.clone()).await;
+                    Message::RemoteListed(host, result)
+                })
+            }
+        }
+    }
+
+    /// Abre uma sessão salva (daqui ou da VPS), ou foca o chat que já a tem aberta.
+    fn resume_saved(&mut self, saved: SavedSession) {
+        self.panel = Panel::None;
+        self.focus = Some(Focus::Chat);
+        if let Some(open) = self.chat_index_for_session(saved.agent, &saved.id) {
+            self.focused = open;
+            return;
+        }
+        let id = self.take_terminal_id();
+        let chat = Chat::resume(id, &saved, self.new_model(saved.agent));
+        self.open_chat(self.chats.len(), chat);
+    }
+
+    pub fn chat_index_for_session(&self, agent: Agent, session_id: &str) -> Option<usize> {
+        self.chats
+            .iter()
+            .position(|chat| chat.agent == agent && chat.is_alive() && chat.session_id.as_deref() == Some(session_id))
+    }
+
     // --model se aplica apenas ao agente escolhido na linha de comando.
     fn new_model(&self, agent: Agent) -> Option<String> {
         (agent == self.default_agent).then(|| self.model.clone()).flatten()
@@ -347,6 +643,7 @@ impl App {
 
     /// Põe o chat na lista, em `index`, abre o agente dele e o deixa em foco.
     fn open_chat(&mut self, index: usize, chat: Chat) {
+        self.panel = Panel::None;
         self.chats.insert(index, chat);
         self.focused = index;
         self.focus = Some(Focus::Chat);
@@ -683,7 +980,7 @@ pub fn run() -> glib::ExitCode {
 fn start(application: &gtk4::Application, flags: Flags) -> Sender<Message> {
     let (tx, rx) = async_channel::unbounded::<Message>();
     let app = Rc::new(RefCell::new(App::new(&flags, tx.clone())));
-    let ui = Ui::new(application, tx.clone());
+    let ui = Ui::new(application, &app.borrow(), tx.clone());
     {
         let mut app = app.borrow_mut();
         let _ = app.update(Message::OpenDirectories(Ok(flags)));
@@ -718,6 +1015,20 @@ fn start(application: &gtk4::Application, flags: Flags) -> Sender<Message> {
         }
     });
     tx
+}
+
+/// O que o painel de nova sessão mostra para um agente escolhido sem o modo do Omarchy.
+fn launch_of(agent: Agent) -> Launch {
+    match agent {
+        Agent::Claude => Launch::Claude,
+        Agent::Codex => Launch::Codex,
+    }
+}
+
+/// Pasta da VPS como digitada; vazio é a home de lá.
+pub fn remote_dir(input: &str) -> String {
+    let input = input.trim();
+    if input.is_empty() { "~".into() } else { input.to_owned() }
 }
 
 /// Última pasta do caminho (`~/projects/chube` → `chube`); a home vira `~`.

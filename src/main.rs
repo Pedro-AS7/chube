@@ -12,6 +12,7 @@ mod commands;
 mod dirs;
 mod groups;
 mod omarchy;
+mod panels;
 mod remote;
 mod restore;
 mod sessions;
