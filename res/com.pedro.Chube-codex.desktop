@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=c-hub (codex)
+Comment=Abrir uma sessão nova do codex nesta pasta no c-hub
+Exec="@BIN@" --agent codex --open-directory %f
+Icon=com.pedro.Chube
+Terminal=false
+NoDisplay=true
+MimeType=inode/directory;
+Categories=Development;
+StartupWMClass=com.pedro.Chube

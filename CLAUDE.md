@@ -38,7 +38,8 @@ Projeto em português (Brasil). Comentários e UI em PT-BR; identificadores de c
 
 ```
 src/
-  main.rs       Argumentos (--model, --prompt) e Settings da janela
+  main.rs       Settings da janela e instância única via D-Bus
+  cli.rs        Argumentos (--agent, --model, --open-directory) e envio à instância aberta
                 (também limpa as variáveis de sessão herdadas de um Claude Code pai e define
                 TERM/COLORTERM para os terminais: aberto pelo launcher, sem TERM o `claude` não tem cor)
   app.rs        App (cosmic::Application): layout em pane_grid (painel | chat | terminal), update/view,
@@ -199,11 +200,11 @@ mudanças, marcadas no topo de cada arquivo:
 - o fundo das mensagens do usuário na TUI do `claude` (`rgb(55,55,55)` no tema escuro dela, `rgb(240,240,240)` no claro;
   só elas usam esses cinzas, conferido na 2.1.303) vira uma faixa branca a 50% com texto preto em todos os temas
   (`USER_MESSAGE_BG`/`USER_MESSAGE_FG`). Sem isso, a mensagem quase não se distinguia.
-
 - caracteres duplicados (2026-11-12): no GNOME/Wayland os caracteres que o IBus monta (ç, ã, á, à, â...) chegam
   como tecla pressionada **e** como `input_method::Event::Commit`, e saíam em dobro ("çç"). O `echo_guard.rs`
   (com testes) descarta o segundo quando o outro caminho trouxe o mesmo texto há até 50 ms. Só o caminho sem
   modificadores das teclas passa por ele. Testado só com `cargo test`; a digitação real fica com o usuário.
+
 `term/mod.rs` substitui o que esses arquivos usavam do cosmic-term (`Config` com os valores padrão de lá, `MenuState`,
 `Action`, que aqui é o `shortcuts::Shortcut`) e tem `spawn()`. Os eventos do PTY chegam por um canal único (`Message::TermEventTx` /
 `TermEvent`), tratados em `App::handle_term_event` como no `Message::TermEvent` do cosmic-term.
@@ -313,3 +314,22 @@ Limitações conhecidas:
 - o status só vem de `~/.claude/sessions`, um arquivo interno do Claude Code (formato pode mudar);
 - o terminal não tem menu de contexto, zoom, busca nem divisão em painéis (o cosmic-term tem);
 - a leitura do `/usage` depende do texto do Claude Code.
+
+
+## Abrir pastas pelo Files (2026-11-11)
+
+- `chube --agent claude|codex --open-directory <pasta>` cria uma sessão nova nessa pasta.
+  Aceita também `-- <pastas>…`. Caminhos relativos são resolvidos no processo chamador; caminhos com espaços,
+  acentos e caracteres de shell são argumentos literais. Caminhos inexistentes, arquivos e agentes inválidos
+  são rejeitados antes de abrir a janela. O transporte D-Bus exige caminhos UTF-8.
+- `cli.rs` valida os argumentos e implementa `CosmicFlags`. A feature `single-instance` e
+  `cosmic::app::run_single_instance` encaminham pedidos à janela aberta. `App::dbus_activation` valida as
+  pastas em `spawn_blocking` e entrega `Message::OpenDirectories`; o `update` grava os chats como de costume.
+  Sem pastas, abrir pelo launcher só ativa a janela e não cria chat. A primeira execução restaura os chats
+  anteriores e acrescenta o pedido externo, focando o último chat novo.
+- `install.sh` instala e remove `com.pedro.Chube-{claude,codex}.desktop`, gerados de `res/`, com
+  `Name=c-hub (claude)` / `c-hub (codex)`, `MimeType=inode/directory;`, `NoDisplay=true` e `%f`.
+  As duas opções aparecem em "Open with" para pastas, sem acrescentar ícones ao launcher.
+  `update-desktop-database` atualiza as associações; o Nautilus continua como aplicativo padrão para pastas.
+- Depois de atualizar, fechar e reabrir o c-hub para a instância atual passar a receber pedidos D-Bus.
+  Testes de `cli.rs`: validação, caminhos relativos, múltiplas pastas e ida/volta pelo transporte dos argumentos.

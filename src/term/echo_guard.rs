@@ -90,3 +90,25 @@ mod tests {
         assert!(guard.should_write(Source::Commit, "é", t + Duration::from_millis(200)));
     }
 }
+
+/// Diagnóstico temporário: se `~/.cache/chube/ime-debug` existir ao abrir o app, cada evento de
+/// teclado/IME e cada envio ao PTY vai para `~/.cache/chube/ime.log`.
+pub fn debug_log(line: impl FnOnce() -> String) {
+    use std::io::Write;
+    use std::sync::OnceLock;
+    static FILE: OnceLock<Option<std::sync::Mutex<std::fs::File>>> = OnceLock::new();
+    let file = FILE.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var_os("HOME")?).join(".cache/chube");
+        if !dir.join("ime-debug").exists() {
+            return None;
+        }
+        std::fs::OpenOptions::new().create(true).append(true).open(dir.join("ime.log")).ok().map(std::sync::Mutex::new)
+    });
+    if let Some(file) = file {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() % 100_000_000)
+            .unwrap_or_default();
+        let _ = writeln!(file.lock().unwrap(), "{stamp} {}", line());
+    }
+}

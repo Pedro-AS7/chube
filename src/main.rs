@@ -1,4 +1,5 @@
 mod agent;
+mod cli;
 mod codex;
 mod app;
 mod chat;
@@ -42,21 +43,14 @@ fn main() -> cosmic::iced::Result {
         .size(Size::new(1400.0, 860.0))
         .size_limits(Limits::NONE.min_width(900.0).min_height(560.0));
 
-    cosmic::app::run::<app::App>(settings, parse_args())
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "--help" || arg == "-h") {
+        println!("Uso: chube [--agent claude|codex] [--model <modelo>] [--open-directory <pasta>] [-- <pastas>…]");
+        return Ok(());
+    }
+    let flags = cli::parse(std::env::args_os().skip(1)).unwrap_or_else(|error| {
+        eprintln!("C-hub: {error}");
+        std::process::exit(2);
+    });
+    cosmic::app::run_single_instance::<app::App>(settings, flags)
 }
 
-/// `chube [--model <modelo>]`
-fn parse_args() -> app::Flags {
-    let mut flags = app::Flags::default();
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--model" => flags.model = args.next(),
-            "--agent" => {
-                flags.agent = args.next().as_deref().and_then(agent::Agent::parse).unwrap_or_default();
-            }
-            _ => eprintln!("argumento ignorado: {arg}"),
-        }
-    }
-    flags
-}

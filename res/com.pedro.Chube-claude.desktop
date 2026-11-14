@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=c-hub (claude)
+Comment=Abrir uma sessão nova do claude nesta pasta no c-hub
+Exec="@BIN@" --agent claude --open-directory %f
+Icon=com.pedro.Chube
+Terminal=false
+NoDisplay=true
+MimeType=inode/directory;
+Categories=Development;
+StartupWMClass=com.pedro.Chube

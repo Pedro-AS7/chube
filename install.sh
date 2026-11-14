@@ -9,12 +9,17 @@ cd "$(dirname "$0")"
 bin="$HOME/.local/bin/chube"
 # O nome do .desktop é o app_id da janela: é assim que o dock liga a janela ao atalho.
 desktop="$HOME/.local/share/applications/com.pedro.Chube.desktop"
+folder_desktops=(
+    "$HOME/.local/share/applications/com.pedro.Chube-claude.desktop"
+    "$HOME/.local/share/applications/com.pedro.Chube-codex.desktop"
+)
 icon="$HOME/.local/share/icons/hicolor/scalable/apps/com.pedro.Chube.svg"
 extension_id="desfoque-chube@pedro"
 extension="$HOME/.local/share/gnome-shell/extensions/$extension_id"
 
 if [[ "${1:-}" == "--uninstall" ]]; then
-    rm -fv "$bin" "$desktop" "$icon"
+    rm -fv "$bin" "$desktop" "$icon" "${folder_desktops[@]}"
+    update-desktop-database "$(dirname "$desktop")" 2>/dev/null || true
     rm -rfv "$extension"
     exit 0
 fi
@@ -27,6 +32,10 @@ install -Dm644 res/com.pedro.Chube.svg "$icon"
 # Caminho absoluto: aberto pelo launcher, o PATH não tem ~/.local/bin.
 mkdir -p "$(dirname "$desktop")"
 sed "s|@BIN@|$bin|" res/com.pedro.Chube.desktop > "$desktop"
+# Entradas separadas: o Files mostra cada agente no seletor de "Open with".
+for agent in claude codex; do
+    sed "s|@BIN@|$bin|" "res/com.pedro.Chube-$agent.desktop" > "$(dirname "$desktop")/com.pedro.Chube-$agent.desktop"
+done
 update-desktop-database "$(dirname "$desktop")" 2>/dev/null || true
 
 # Extensão do GNOME: copiada sempre (não custa nada fora do GNOME) e ligada pela lista do

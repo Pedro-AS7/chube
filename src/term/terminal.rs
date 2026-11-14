@@ -398,6 +398,8 @@ impl Terminal {
     }
 
     pub fn input_no_scroll<I: Into<Cow<'static, [u8]>>>(&self, input: I) {
+        let input = input.into();
+        super::echo_guard::debug_log(|| format!("pty {:?}", String::from_utf8_lossy(&input)));
         self.notifier.notify(input);
     }
 

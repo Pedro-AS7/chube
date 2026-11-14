@@ -910,6 +910,9 @@ where
 
         let is_app_cursor = terminal.term.lock().mode().contains(TermMode::APP_CURSOR);
         let is_mouse_mode = terminal.term.lock().mode().intersects(TermMode::MOUSE_MODE);
+        if matches!(event, Event::Keyboard(KeyEvent::KeyPressed { .. }) | Event::InputMethod(_)) {
+            super::echo_guard::debug_log(|| format!("widget {:p} foco={} {:?}", state as *const State, state.is_focused, event));
+        }
         match event {
             Event::Window(event) => match event {
                 cosmic::iced::window::Event::Focused => {

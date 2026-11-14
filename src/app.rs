@@ -16,6 +16,7 @@ use cosmic::{Application, ApplicationExt, Element, theme};
 
 use crate::agent::Agent;
 use crate::codex;
+use crate::cli::{self, Flags};
 use crate::chat::{Chat, ModeChange, Status};
 use crate::claude::{self, Mode, Start};
 use crate::commands::{self, Command};
@@ -62,6 +63,7 @@ pub enum Section {
 #[derive(Clone, Debug)]
 pub enum Message {
     SelectChat(usize),
+    OpenDirectories(Result<Flags, String>),
     NewChat,
     NewChatInput(String),
     NewChatAgent(usize),
@@ -134,14 +136,6 @@ pub struct Polled {
     stats: Option<Stats>,
     codex: Option<codex::Snapshot>,
     codex_hint: Option<String>,
-}
-
-/// Opções da linha de comando.
-#[derive(Clone, Debug, Default)]
-pub struct Flags {
-    pub agent: Agent,
-    /// Modelo usado nos chats novos (padrão: o do Claude Code).
-    pub model: Option<String>,
 }
 
 pub struct App {
@@ -225,7 +219,7 @@ impl Application for App {
             chats: Vec::new(),
             focused: 0,
             default_dir,
-            model: flags.model,
+            model: flags.model.clone(),
             default_agent: flags.agent,
             new_chat_agent: flags.agent,
             composer_id: widget::Id::unique(),
@@ -286,7 +280,23 @@ impl Application for App {
             Theme::System => Task::none(),
             theme => cosmic::command::set_theme(theme.cosmic()),
         };
-        (app, Task::batch([title, usage, theme]))
+        let open = app.open_directories(flags);
+        (app, Task::batch([title, usage, theme, open]))
+    }
+
+    fn dbus_activation(&mut self, message: cosmic::dbus_activation::Message) -> Task<Message> {
+        if let cosmic::dbus_activation::Details::ActivateAction { action, args } = message.msg {
+            if action == cli::OPEN_ACTION {
+                return cosmic::task::future(async move {
+                    // Valida as pastas fora da thread da interface, inclusive se foram removidas
+                    // entre a chamada do Files e a chegada à janela aberta.
+                    let result = tokio::task::spawn_blocking(move || cli::parse(args)).await
+                        .unwrap_or_else(|error| Err(format!("Não consegui abrir as pastas: {error}")));
+                    Message::OpenDirectories(result)
+                });
+            }
+        }
+        self.focus_chat()
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -416,7 +426,10 @@ impl Application for App {
 
 impl App {
     fn handle(&mut self, message: Message) -> Task<Message> {
-        match message {            Message::SelectChat(index) => {
+        match message {
+            Message::OpenDirectories(Ok(flags)) => return self.open_directories(flags),
+            Message::OpenDirectories(Err(error)) => self.notice = Some(error),
+            Message::SelectChat(index) => {
                 self.notice = None;
                 if index < self.chats.len() {
                     self.focused = index;
@@ -886,6 +899,24 @@ impl App {
             main
         };
         self.panes = pane_grid::State::with_configuration(layout);
+    }
+
+    /// Uma chamada externa cria chats novos; não retoma outra sessão da mesma pasta.
+    fn open_directories(&mut self, flags: Flags) -> Task<Message> {
+        if flags.directories.is_empty() {
+            return Task::none();
+        }
+        self.notice = None;
+        self.new_chat_input = None;
+        self.chat_visible = true;
+        self.rebuild_panes();
+        let mut tasks = Vec::new();
+        for directory in flags.directories {
+            let id = self.take_terminal_id();
+            let chat = Chat::new(id, flags.agent, PathBuf::from(directory), flags.model.clone(), None);
+            tasks.push(self.open_chat(self.chats.len(), chat));
+        }
+        Task::batch(tasks)
     }
 
     // --model se aplica apenas ao agente escolhido na linha de comando.
