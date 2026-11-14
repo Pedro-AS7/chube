@@ -32,8 +32,6 @@ use crate::usage::{self, Limit, Window};
 /// Intervalo de atualização automática do painel de uso. Os limites vêm do arquivo que o
 /// Omarchy atualiza; só sem ele o Chube roda o `/usage`.
 const REFRESH_EVERY: Duration = Duration::from_secs(120);
-/// Intervalo da leitura do estado dos chats da VPS (uma consulta por host, pela conexão aberta).
-const REMOTE_POLL_EVERY: Duration = Duration::from_secs(3);
 /// Intervalo da conferência do tema do Omarchy (o Chube muda junto com `omarchy theme set`).
 const THEME_CHECK_EVERY: Duration = Duration::from_secs(2);
 /// Intervalo da leitura do status das sessões (`~/.claude/sessions`).
@@ -208,9 +206,9 @@ pub struct App {
     /// Id da rolagem horizontal das abas do terminal.
     terminal_tabs_id: widget::Id,
     polling: bool,
-    /// Hosts com uma leitura de estado em andamento, e a hora da última leitura.
-    remote_polling: HashSet<String>,
-    remote_polled: Option<std::time::Instant>,
+    /// Hosts cuja conexão de estado caiu ou foi negada: não reabre sozinha (cada conexão pede
+    /// permissão), só quando um chat de lá (re)conecta ou a lista de lá carrega.
+    remote_poll_stopped: HashSet<String>,
     panes: pane_grid::State<Section>,
     sidebar_visible: bool,
     chat_visible: bool,
@@ -300,8 +298,7 @@ impl Application for App {
             tab_terminal_id: widget::Id::unique(),
             terminal_tabs_id: widget::Id::unique(),
             polling: false,
-            remote_polling: HashSet::new(),
-            remote_polled: None,
+            remote_poll_stopped: HashSet::new(),
             panes: pane_grid::State::new(Section::Chat).0,
             sidebar_visible: true,
             chat_visible: true,
@@ -403,6 +400,13 @@ impl Application for App {
             }),
         ];
         subscriptions.push(cosmic::iced::time::every(THEME_CHECK_EVERY).map(|_| Message::CheckTheme));
+        // Uma conexão de estado por host da VPS (uma confirmação da chave), aberta enquanto houver
+        // chat lá; sair da lista fecha a conexão.
+        for host in self.remote_poll_hosts() {
+            subscriptions.push(
+                Subscription::run_with(host, remote::poll_stream).map(|(host, result)| Message::RemotePolled(host, result)),
+            );
+        }
         if self.chats.iter().any(Chat::is_alive) {
             subscriptions.push(cosmic::iced::time::every(POLL_EVERY).map(|_| Message::Poll));
         }
@@ -532,7 +536,10 @@ impl App {
             Message::SessionsLoaded(list) => self.saved_sessions = Some(list),
             Message::RemoteListed(host, result) => {
                 let state = match result {
-                    Ok(listing) => RemoteState::Loaded(listing),
+                    Ok(listing) => {
+                        self.remote_poll_stopped.remove(&host);
+                        RemoteState::Loaded(listing)
+                    }
                     Err(error) => RemoteState::Failed(error),
                 };
                 self.remote_sessions.insert(host, state);
@@ -779,20 +786,23 @@ impl App {
                     chat.send(bytes);
                 }
             }
-            Message::Poll => return Task::batch([self.poll(), self.poll_remote()]),
+            Message::Poll => return self.poll(),
             Message::Polled(list) => {
                 self.polling = false;
                 self.apply_poll(list);
                 return self.fetch_context_window();
             }
-            Message::RemotePolled(host, result) => {
-                self.remote_polling.remove(&host);
-                // Sem conexão aberta ou erro na consulta: fica o status vindo do título.
-                if let Ok(list) = result {
+            Message::RemotePolled(host, result) => match result {
+                Ok(list) => {
                     self.apply_remote_poll(&host, list);
                     return self.fetch_context_window();
                 }
-            }
+                // Conexão negada ou caída: fica o status vindo do título até reconectar.
+                Err(error) => {
+                    log::warn!("estado de {host}: {error}");
+                    self.remote_poll_stopped.insert(host);
+                }
+            },
             Message::OpenLink(url) => {
                 let _ = std::process::Command::new("xdg-open").arg(url).spawn();
             }
@@ -1152,6 +1162,9 @@ impl App {
             return;
         }
         let command = chat.command();
+        if let Some(host) = &chat.host {
+            self.remote_poll_stopped.remove(host);
+        }
         match term::spawn(chat.id, events, chat.local_dir(), Some(command), &theme::active()) {
             Ok(terminal) => chat.terminal = Some(terminal),
             Err(err) => {
@@ -1317,32 +1330,20 @@ impl App {
         })
     }
 
-    /// Lê o estado dos chats do Claude Code da VPS (status, id da sessão, modelo e contexto), uma
-    /// consulta por host a cada `REMOTE_POLL_EVERY`.
-    fn poll_remote(&mut self) -> Task<Message> {
-        if self.remote_polled.is_some_and(|time| time.elapsed() < REMOTE_POLL_EVERY) {
-            return Task::none();
-        }
-        let mut by_host: HashMap<String, Vec<String>> = HashMap::new();
-        for chat in self.chats.iter().filter(|chat| chat.is_alive() && chat.agent == Agent::Claude) {
-            if let (Some(host), Some(tmux)) = (&chat.host, &chat.tmux) {
-                if chat.terminal.is_some() && !self.remote_polling.contains(host) {
-                    by_host.entry(host.clone()).or_default().push(tmux.clone());
-                }
-            }
-        }
-        if by_host.is_empty() {
-            return Task::none();
-        }
-        self.remote_polled = Some(std::time::Instant::now());
-        let tasks = by_host.into_iter().map(|(host, names)| {
-            self.remote_polling.insert(host.clone());
-            cosmic::task::future(async move {
-                let result = remote::poll(host.clone(), names).await;
-                Message::RemotePolled(host, result)
+    /// Hosts que precisam da conexão de estado: com um chat do Claude vivo, cujo agente já subiu
+    /// (a chave já foi liberada; antes disso, a conexão de estado pediria a senha de novo).
+    fn remote_poll_hosts(&self) -> HashSet<String> {
+        self.chats
+            .iter()
+            .filter(|chat| {
+                chat.is_alive()
+                    && chat.agent == Agent::Claude
+                    && chat.terminal.is_some()
+                    && !matches!(chat.status, Status::Starting | Status::Suspended)
             })
-        });
-        Task::batch(tasks.collect::<Vec<_>>())
+            .filter_map(|chat| chat.host.clone())
+            .filter(|host| !self.remote_poll_stopped.contains(host))
+            .collect()
     }
 
     fn apply_remote_poll(&mut self, host: &str, list: Vec<RemoteStatus>) {

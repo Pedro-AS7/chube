@@ -5,10 +5,11 @@
 //! Chube ou cair a rede só desconecta: o agente continua na VPS, e reabrir o chat volta a ele.
 //! Também dá para entrar pelo celular (`tmux attach -t <nome>`).
 //!
-//! As conexões compartilham um mestre do SSH (`ControlMaster`, socket em `$XDG_RUNTIME_DIR`): a
-//! senha da chave é pedida uma vez, no terminal do primeiro chat, e as consultas em segundo
-//! plano (sessões salvas, tmux abertos) reaproveitam a conexão sem pedir nada. Sem o mestre e
-//! sem um agente SSH com a chave, essas consultas falham com uma mensagem, e o chat pede a senha.
+//! Cada conexão autentica de novo, sem mestre compartilhado (`ControlMaster`): com a chave no
+//! agente com confirmação (`AddKeysToAgent confirm`), cada uma pede permissão numa janela, e um
+//! processo qualquer não consegue pegar carona numa conexão aberta pelo Chube. Para o estado dos
+//! chats não abrir uma janela a cada consulta, ele vem por uma conexão fixa por host
+//! (`poll_stream`), aberta uma vez e reaproveitada enquanto houver chat lá.
 //!
 //! Nada é gravado na VPS além do que o agente e o tmux já gravam. As opções do tmux valem só
 //! para as sessões criadas pelo Chube (`set-option -t`), menos a de cor (`terminal-features`),
@@ -75,21 +76,14 @@ fn quote_dir(dir: &str) -> String {
     }
 }
 
-/// Opções de SSH de todas as conexões do Chube: o mestre compartilhado e um aviso de vida, para
-/// uma rede caída fechar o chat em vez de deixá-lo congelado.
+/// Opções de SSH de todas as conexões do Chube: sem mestre compartilhado (mesmo que o
+/// `~/.ssh/config` tenha um), para cada conexão autenticar e pedir a confirmação da chave, e um
+/// aviso de vida, para uma rede caída fechar o chat em vez de deixá-lo congelado.
 fn ssh_options() -> Vec<String> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
-    let socket = runtime.join("chube-ssh-%C");
-    [
-        "ControlMaster=auto".to_owned(),
-        format!("ControlPath={}", socket.display()),
-        "ControlPersist=15m".to_owned(),
-        "ServerAliveInterval=15".to_owned(),
-        "ServerAliveCountMax=4".to_owned(),
-    ]
-    .into_iter()
-    .flat_map(|option| ["-o".to_owned(), option])
-    .collect()
+    ["ControlMaster=no", "ControlPath=none", "ServerAliveInterval=15", "ServerAliveCountMax=4"]
+        .into_iter()
+        .flat_map(|option| ["-o".to_owned(), option.to_owned()])
+        .collect()
 }
 
 /// Linha de comando (para o shell da VPS) que roda o agente. Num login sem terminal, o PATH do
@@ -175,7 +169,7 @@ async fn run(host: &str, script: &str) -> Result<String, String> {
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     Err(if stderr.contains("Permission denied") {
-        format!("sem acesso a {host} sem senha: abra um chat lá (o terminal pede a senha da chave) e tente de novo")
+        format!("sem acesso a {host}: a chave não está no agente ou o uso foi negado. Abra um chat lá (o terminal pede a senha da chave) e tente de novo")
     } else {
         stderr.lines().last().unwrap_or("erro no ssh").trim().to_owned()
     })
@@ -198,31 +192,80 @@ pub struct RemoteStatus {
     pub context_tokens: u32,
 }
 
-/// Lê o estado dos chats do Claude Code nos tmux `names` da VPS, numa consulta só.
-///
-/// Só usa uma conexão mestre que já existe (a do terminal do chat): sem ela, não faz nada, para
-/// uma chave trancada no agente SSH não abrir a janela de senha a cada poucos segundos.
-pub async fn poll(host: String, names: Vec<String>) -> Result<Vec<RemoteStatus>, String> {
-    let mut check = tokio::process::Command::new("ssh");
-    check.args(["-O", "check"]).args(ssh_options()).args(["--", &host]);
-    let master = check
+/// Resultado de uma leitura de estado de um host: a lista ou, quando a conexão caiu ou foi negada,
+/// o erro (depois do erro, o stream termina).
+pub type PollItem = (String, Result<Vec<RemoteStatus>, String>);
+
+/// Estado dos chats do Claude Code de um host, por uma conexão SSH só (uma confirmação da chave):
+/// lá, um laço lê todas as sessões do tmux a cada 3 s e manda o resultado. A conexão fecha quando
+/// o stream é descartado (a assinatura sai do app).
+pub fn poll_stream(host: &String) -> impl cosmic::iced::futures::Stream<Item = PollItem> + use<> {
+    let host = host.clone();
+    cosmic::iced::stream::channel(4, async move |mut output| {
+        use cosmic::iced::futures::SinkExt;
+        let error = poll_connection(&host, &mut output).await;
+        let _ = output.send((host, Err(error))).await;
+    })
+}
+
+async fn poll_connection(
+    host: &str,
+    output: &mut cosmic::iced::futures::channel::mpsc::Sender<PollItem>,
+) -> String {
+    use cosmic::iced::futures::SinkExt;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+    let child = tokio::process::Command::new("ssh")
+        .args(ssh_args(host, false, &poll_loop_script()))
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .status();
-    match tokio::time::timeout(Duration::from_secs(3), master).await {
-        Ok(Ok(status)) if status.success() => {}
-        _ => return Err("sem conexão aberta".into()),
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => return format!("não consegui rodar o ssh: {error}"),
+    };
+    let (Some(stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return "sem saída do ssh".into();
+    };
+    let mut lines = BufReader::new(stdout).lines();
+    let mut batch = String::new();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line == "E" {
+            if output.send((host.to_owned(), Ok(parse_poll(&batch)))).await.is_err() {
+                return String::new();
+            }
+            batch.clear();
+        } else {
+            batch.push_str(&line);
+            batch.push('\n');
+        }
     }
-    let text = run(&host, &poll_script(&names)).await?;
-    Ok(parse_poll(&text))
+    let mut text = String::new();
+    let _ = stderr.read_to_string(&mut text).await;
+    let _ = child.wait().await;
+    text.lines().last().unwrap_or("a conexão do estado fechou").trim().to_owned()
+}
+
+/// Laço da conexão de estado: `chube_poll` em cada sessão do tmux e um `E` no fim de cada volta.
+/// Quando o Chube fecha a conexão, o próximo `echo` recebe SIGPIPE e o laço termina.
+fn poll_loop_script() -> String {
+    format!(
+        "{POLL_FUNCTION}while :; do\n  tmux list-sessions -F '#{{session_name}}' 2>/dev/null | while IFS= read -r t; do chube_poll \"$t\"; done\n  echo E\n  sleep 3\ndone\n"
+    )
+}
+
+/// Os mesmos `chube_poll` só para os tmux `names` (usado nos testes do script).
+#[cfg(test)]
+fn poll_script(names: &[String]) -> String {
+    let calls: Vec<String> = names.iter().map(|name| format!("chube_poll {}", quote(name))).collect();
+    format!("{POLL_FUNCTION}{}\n", calls.join("\n"))
 }
 
 /// Para cada tmux: o `claude` é o processo do painel ou um filho dele (no chat do Chube, o `env`
 /// que roda o `claude` é filho do `bash -lc`; num tmux de fora, o `claude` é filho do shell).
-fn poll_script(names: &[String]) -> String {
-    const FUNCTION: &str = r#"chube_poll() {
+const POLL_FUNCTION: &str = r#"chube_poll() {
   t=$1; sid=; st=; l=
   pp=$(tmux display-message -p -t "$t" '#{pane_pid}' 2>/dev/null) || return 0
   f=
@@ -239,15 +282,9 @@ fn poll_script(names: &[String]) -> String {
   fi
   m=$(printf '%s' "$l" | grep -o '"model":"[^"]*"' | head -n 1 | cut -d '"' -f 4)
   u=$(printf '%s' "$l" | grep -o '"usage":{[^}]*' | head -n 1)
-  printf 'C	%s	%s	%s	%s	%s
-' "$t" "$sid" "$st" "$m" "$u"
+  printf 'C\t%s\t%s\t%s\t%s\t%s\n' "$t" "$sid" "$st" "$m" "$u"
 }
 "#;
-    let calls: Vec<String> = names.iter().map(|name| format!("chube_poll {}", quote(name))).collect();
-    format!("{FUNCTION}{}
-", calls.join("
-"))
-}
 
 fn parse_poll(text: &str) -> Vec<RemoteStatus> {
     text.lines()
