@@ -1,10 +1,9 @@
-//! Argumentos também enviados à janela aberta pelo D-Bus do libcosmic.
+//! Argumentos da linha de comando. Com o app já aberto, o GApplication manda a linha de
+//! comando à instância aberta pelo D-Bus, e ela é lida lá (`connect_command_line`).
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::agent::Agent;
-
-pub const OPEN_ACTION: &str = "open-directories";
 
 #[derive(Clone, Debug, Default)]
 pub struct Flags {
@@ -16,29 +15,16 @@ pub struct Flags {
     pub directories: Vec<String>,
 }
 
-impl cosmic::app::CosmicFlags for Flags {
-    type SubCommand = &'static str;
-    type Args = Vec<String>;
-
-    fn action(&self) -> Option<&Self::SubCommand> {
-        (!self.directories.is_empty()).then_some(&OPEN_ACTION)
-    }
-
-    fn args(&self) -> Vec<&str> {
-        let mut args = vec!["--agent", if self.auto { "omarchy" } else { self.agent.key() }];
-        if let Some(model) = &self.model {
-            args.extend(["--model", model.as_str()]);
-        }
-        args.push("--");
-        args.extend(self.directories.iter().map(String::as_str));
-        args
-    }
+pub fn parse(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Flags, String> {
+    parse_in(args, None)
 }
 
-pub fn parse(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Flags, String> {
+/// Como `parse`, com os caminhos relativos resolvidos em `base`: a pasta de quem chamou, quando a
+/// linha de comando chega de outro processo (o app já aberto recebe a chamada do Files).
+pub fn parse_in(args: impl IntoIterator<Item = impl Into<OsString>>, base: Option<&Path>) -> Result<Flags, String> {
     let mut flags = Flags::default();
     let mut args = args.into_iter().map(|arg| {
-        arg.into().into_string().map_err(|_| "O caminho precisa ser UTF-8 para envio por D-Bus".to_owned())
+        arg.into().into_string().map_err(|_| "O caminho precisa ser UTF-8".to_owned())
     });
     while let Some(arg) = args.next() {
         let arg = arg?;
@@ -66,11 +52,16 @@ pub fn parse(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Flag
         }
     }
     for directory in &mut flags.directories {
-        let path = PathBuf::from(&*directory).canonicalize()
+        let path = PathBuf::from(&*directory);
+        let path = match base {
+            Some(base) if path.is_relative() => base.join(path),
+            _ => path,
+        };
+        let path = path.canonicalize()
             .map_err(|error| format!("Não consegui abrir {directory}: {error}"))?;
         if !path.is_dir() { return Err(format!("{directory} não é uma pasta")); }
         *directory = path.into_os_string().into_string()
-            .map_err(|_| "O caminho precisa ser UTF-8 para envio por D-Bus".to_owned())?;
+            .map_err(|_| "O caminho precisa ser UTF-8".to_owned())?;
     }
     Ok(flags)
 }
@@ -78,25 +69,22 @@ pub fn parse(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Flag
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cosmic::app::CosmicFlags;
 
     #[test]
     fn launcher_does_not_create_a_session() {
         let flags = parse(Vec::<String>::new()).unwrap();
         assert!(flags.directories.is_empty());
-        assert_eq!(flags.action(), None);
         assert_eq!(flags.agent, Agent::Claude);
     }
 
     #[test]
-    fn directory_and_agent_survive_dbus_round_trip() {
+    fn directory_with_odd_characters_and_agent() {
         let base = std::env::temp_dir().join(format!("chube-cli-{}", uuid::Uuid::new_v4()));
         let folder = base.join("pasta com espaço, acentuação e $() ' \"");
         std::fs::create_dir_all(&folder).unwrap();
         let input = folder.to_str().unwrap();
         let flags = parse(["--agent", "codex", "--model", "modelo", "--open-directory", input]).unwrap();
-        assert_eq!(flags.action(), Some(&OPEN_ACTION));
-        let received = parse(flags.args()).unwrap();
+        let received = flags;
         assert_eq!(received.agent, Agent::Codex);
         assert_eq!(received.model.as_deref(), Some("modelo"));
         assert_eq!(received.directories, vec![input]);
@@ -107,6 +95,13 @@ mod tests {
     fn resolves_relative_paths_before_sending_to_other_process() {
         let flags = parse(["--open-directory", "."]).unwrap();
         assert_eq!(PathBuf::from(&flags.directories[0]), std::env::current_dir().unwrap().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn relative_paths_use_the_caller_directory() {
+        let base = std::env::temp_dir();
+        let flags = parse_in(["--open-directory", "."], Some(&base)).unwrap();
+        assert_eq!(PathBuf::from(&flags.directories[0]), base.canonicalize().unwrap());
     }
 
     #[test]

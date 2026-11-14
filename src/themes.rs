@@ -1,16 +1,41 @@
 //! Cores do Chube: as do tema atual do Omarchy (`omarchy.rs`), relidas quando o tema muda.
 //!
-//! A paleta fica num `static` porque as funções de estilo dos widgets não recebem o `App`.
+//! A paleta fica num `static` para ser lida de qualquer parte da interface (CSS e terminais).
 //! Os tokens seguem o `shell.toml` do Omarchy (menus, controles e popups do shell): linhas
 //! retas, seleção com fundo do texto a 8% e texto no acento, bordas do texto a 25–40%.
 
 use std::sync::{Arc, RwLock};
 
-use cosmic::cosmic_theme::ThemeBuilder;
-use cosmic::cosmic_theme::palette::Srgb;
-use cosmic::iced::Color;
-
 use crate::omarchy::{Rgb, ThemeColors};
+
+/// Cor RGBA com componentes de 0 a 1.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Color {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+impl Color {
+    pub const fn from_rgb8(r: u8, g: u8, b: u8) -> Self {
+        Self { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a: 1.0 }
+    }
+
+    pub fn with_alpha(self, a: f32) -> Self {
+        Self { a, ..self }
+    }
+
+    /// `rgba(…)` para o CSS do GTK.
+    pub fn css(self) -> String {
+        let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+        format!("rgba({}, {}, {}, {:.3})", byte(self.r), byte(self.g), byte(self.b), self.a)
+    }
+
+    pub fn rgba(self) -> gtk4::gdk::RGBA {
+        gtk4::gdk::RGBA::new(self.r, self.g, self.b, self.a)
+    }
+}
 
 /// Paleta em uso.
 pub struct Palette {
@@ -57,30 +82,6 @@ impl Palette {
     pub fn text_alpha(&self, alpha: f32) -> Color {
         Color { a: alpha, ..self.text }
     }
-
-    /// Tema do libcosmic com as mesmas cores, para os widgets dele (campos de texto, dicas,
-    /// barras de rolagem). Sem cantos arredondados, como tudo no Omarchy.
-    pub fn cosmic(&self) -> cosmic::Theme {
-        let builder = if self.light { ThemeBuilder::light() } else { ThemeBuilder::dark() };
-        let square = cosmic::cosmic_theme::CornerRadii {
-            radius_0: [0.0; 4],
-            radius_xs: [0.0; 4],
-            radius_s: [0.0; 4],
-            radius_m: [0.0; 4],
-            radius_l: [0.0; 4],
-            radius_xl: [0.0; 4],
-        };
-        let builder = builder
-            .bg_color(srgb(self.background).into())
-            .text_tint(srgb(self.text))
-            .accent(srgb(self.accent))
-            .success(srgb(self.success))
-            .warning(srgb(self.warning))
-            .destructive(srgb(self.danger))
-            .neutral_tint(srgb(self.dim))
-            .corner_radii(square);
-        cosmic::Theme::custom(Arc::new(builder.build()))
-    }
 }
 
 static CURRENT: RwLock<Option<Arc<Palette>>> = RwLock::new(None);
@@ -95,13 +96,6 @@ pub fn current() -> Arc<Palette> {
 
 /// Relê o tema do Omarchy (depois de um `omarchy theme set` ou do modo vidro).
 pub fn reload() -> Arc<Palette> {
-    // A interface e os terminais usam a família "monospace" do cosmic-text, que por padrão não é
-    // a do fontconfig: sem isto, sairia a Noto/DejaVu Sans Mono no lugar da fonte do Omarchy.
-    if let Some(family) = crate::omarchy::monospace_family() {
-        if let Ok(mut fonts) = cosmic::iced::advanced::graphics::text::font_system().write() {
-            fonts.raw().db_mut().set_monospace_family(family);
-        }
-    }
     let palette = Arc::new(Palette::new(ThemeColors::load(), crate::omarchy::terminal_font_px()));
     if let Ok(mut current) = CURRENT.write() {
         *current = Some(palette.clone());
@@ -111,10 +105,6 @@ pub fn reload() -> Arc<Palette> {
 
 pub const fn rgb(hex: Rgb) -> Color {
     Color::from_rgb8((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
-}
-
-fn srgb(color: Color) -> Srgb {
-    Srgb::new(color.r, color.g, color.b)
 }
 
 #[cfg(test)]

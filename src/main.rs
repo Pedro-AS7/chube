@@ -1,3 +1,7 @@
+// Durante a migração para o GTK (branch `gtk`), partes dos módulos só voltam a ser usadas
+// quando os painéis forem portados (nova sessão, sessões salvas, VPS, uso).
+#![allow(dead_code)]
+
 mod agent;
 mod cli;
 mod codex;
@@ -12,11 +16,11 @@ mod remote;
 mod restore;
 mod sessions;
 mod shortcuts;
-mod term;
+mod task;
+mod terminal;
 mod themes;
+mod ui;
 mod usage;
-
-use cosmic::iced::{Limits, Size};
 
 /// Variáveis que um Claude Code define para os processos filhos. Herdadas (Chube aberto de
 /// dentro de uma sessão), fazem o `claude` dos chats se achar aninhado e não gravar a sessão.
@@ -33,27 +37,15 @@ const CLAUDE_SESSION_VARS: [&str; 10] = [
     "CLAUDE_EFFORT",
 ];
 
-fn main() -> cosmic::iced::Result {
+fn main() -> gtk4::glib::ExitCode {
     for var in CLAUDE_SESSION_VARS {
         // SAFETY: nenhuma outra thread existe ainda.
         unsafe { std::env::remove_var(var) };
     }
-    // TERM e COLORTERM=truecolor para os terminais, como no cosmic-term. Aberto pelo launcher,
-    // o Chube não herda TERM, e sem ele o `claude` não manda cor nenhuma.
-    alacritty_terminal::tty::setup_env();
-
-    let settings = cosmic::app::Settings::default()
-        .size(Size::new(1400.0, 860.0))
-        .size_limits(Limits::NONE.min_width(900.0).min_height(560.0));
-
     if std::env::args_os().nth(1).is_some_and(|arg| arg == "--help" || arg == "-h") {
         println!("Uso: chube [--agent omarchy|claude|codex] [--model <modelo>] [--open-directory <pasta>] [-- <pastas>…]");
-        return Ok(());
+        return gtk4::glib::ExitCode::SUCCESS;
     }
-    let flags = cli::parse(std::env::args_os().skip(1)).unwrap_or_else(|error| {
-        eprintln!("C-hub: {error}");
-        std::process::exit(2);
-    });
-    cosmic::app::run_single_instance::<app::App>(settings, flags)
+    // A linha de comando é lida em `app::run` (no app já aberto, se houver um).
+    app::run()
 }
-

@@ -1,12 +1,7 @@
-//! Atalhos de teclado do app. Valem também com o foco num terminal: os terminais
-//! recebem esta mesma tabela (`term::KEY_BINDS`) e deixam essas teclas passar sem mandá-las ao PTY.
+//! Atalhos de teclado do app. Valem também com o foco num terminal: a janela os recebe na fase
+//! de captura, antes do VTE, e eles não chegam ao PTY.
 
-use std::collections::HashMap;
-use std::sync::LazyLock;
-
-use cosmic::iced::keyboard::key::{Named, Physical};
-use cosmic::iced::keyboard::{Key, Modifiers};
-use cosmic::widget::menu::key_bind::{KeyBind, Modifier};
+use gtk4::gdk::{Key, ModifierType};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Shortcut {
@@ -46,58 +41,54 @@ pub const LIST: [(&str, Shortcut); 7] = [
     ("Ctrl+Shift+↓", Shortcut::NextChat),
 ];
 
-pub static KEY_BINDS: LazyLock<HashMap<KeyBind, Shortcut>> = LazyLock::new(|| {
-    use Modifier::{Ctrl, Shift};
-    let bind = |modifiers: &[Modifier], key: Key| KeyBind {
-        modifiers: modifiers.to_vec(),
-        key,
-    };
-    // Os números valem pela tecla física: com Shift, o caractere muda conforme o layout.
-    HashMap::from([
-        (bind(&[Ctrl, Shift], Key::Character("n".into())), Shortcut::NewChat),
-        (bind(&[Ctrl, Shift], Key::Character("1".into())), Shortcut::ToggleSidebar),
-        (bind(&[Ctrl, Shift], Key::Character("2".into())), Shortcut::ToggleChat),
-        (bind(&[Ctrl, Shift], Key::Character("3".into())), Shortcut::ToggleTerminal),
-        (bind(&[Ctrl], Key::Named(Named::Tab)), Shortcut::SwitchFocus),
-        (bind(&[Ctrl, Shift], Key::Named(Named::ArrowUp)), Shortcut::PreviousChat),
-        (bind(&[Ctrl, Shift], Key::Named(Named::ArrowDown)), Shortcut::NextChat),
-    ])
-});
+/// Teclas físicas (código do evdev + 8, como o GDK entrega) dos números: com Shift, o caractere
+/// muda conforme o layout, então os números valem pela tecla.
+const KEYCODE_1: u32 = 10;
+const KEYCODE_2: u32 = 11;
+const KEYCODE_3: u32 = 12;
 
-/// O atalho de uma tecla pressionada, se houver.
-pub fn find(modifiers: Modifiers, key: &Key, physical_key: &Physical) -> Option<Shortcut> {
-    KEY_BINDS
-        .iter()
-        .find(|(bind, _)| bind.matches(modifiers, key, Some(physical_key)))
-        .map(|(_, shortcut)| *shortcut)
+/// O atalho de uma tecla pressionada, se houver. Só Ctrl e Shift contam (Caps Lock, Num Lock
+/// e afins ficam de fora).
+pub fn find(keyval: Key, keycode: u32, state: ModifierType) -> Option<Shortcut> {
+    let state = state & (ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK);
+    let ctrl = ModifierType::CONTROL_MASK;
+    let ctrl_shift = ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK;
+    if state == ctrl_shift {
+        match keycode {
+            KEYCODE_1 => return Some(Shortcut::ToggleSidebar),
+            KEYCODE_2 => return Some(Shortcut::ToggleChat),
+            KEYCODE_3 => return Some(Shortcut::ToggleTerminal),
+            _ => {}
+        }
+        return match keyval.to_lower() {
+            Key::n => Some(Shortcut::NewChat),
+            Key::Up | Key::KP_Up => Some(Shortcut::PreviousChat),
+            Key::Down | Key::KP_Down => Some(Shortcut::NextChat),
+            _ => None,
+        };
+    }
+    if state == ctrl && keyval == Key::Tab {
+        return Some(Shortcut::SwitchFocus);
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cosmic::iced::keyboard::key::Code;
-
-    fn ctrl_shift() -> Modifiers {
-        Modifiers::CTRL | Modifiers::SHIFT
-    }
 
     #[test]
     fn acha_os_atalhos() {
-        let physical = Physical::Code(Code::KeyN);
-        assert_eq!(find(ctrl_shift(), &Key::Character("n".into()), &physical), Some(Shortcut::NewChat));
+        let ctrl_shift = ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK;
+        assert_eq!(find(Key::n, 57, ctrl_shift), Some(Shortcut::NewChat));
         // Caps Lock ou Shift deixam a letra maiúscula.
-        assert_eq!(find(ctrl_shift(), &Key::Character("N".into()), &physical), Some(Shortcut::NewChat));
-        assert_eq!(find(Modifiers::CTRL, &Key::Character("n".into()), &physical), None);
-
-        let physical = Physical::Code(Code::Digit2);
-        assert_eq!(find(ctrl_shift(), &Key::Character("2".into()), &physical), Some(Shortcut::ToggleChat));
-
-        let physical = Physical::Code(Code::Tab);
-        assert_eq!(find(Modifiers::CTRL, &Key::Named(Named::Tab), &physical), Some(Shortcut::SwitchFocus));
-        assert_eq!(find(Modifiers::SHIFT, &Key::Named(Named::Tab), &physical), None);
-
-        let physical = Physical::Code(Code::ArrowDown);
-        assert_eq!(find(ctrl_shift(), &Key::Named(Named::ArrowDown), &physical), Some(Shortcut::NextChat));
-        assert_eq!(find(Modifiers::CTRL, &Key::Named(Named::ArrowDown), &physical), None);
+        assert_eq!(find(Key::N, 57, ctrl_shift | ModifierType::LOCK_MASK), Some(Shortcut::NewChat));
+        assert_eq!(find(Key::n, 57, ModifierType::CONTROL_MASK), None);
+        // Ctrl+Shift+2 no layout br dá `@`: vale a tecla física.
+        assert_eq!(find(Key::at, KEYCODE_2, ctrl_shift), Some(Shortcut::ToggleChat));
+        assert_eq!(find(Key::Tab, 23, ModifierType::CONTROL_MASK), Some(Shortcut::SwitchFocus));
+        assert_eq!(find(Key::ISO_Left_Tab, 23, ModifierType::SHIFT_MASK), None);
+        assert_eq!(find(Key::Down, 116, ctrl_shift), Some(Shortcut::NextChat));
+        assert_eq!(find(Key::Down, 116, ModifierType::CONTROL_MASK), None);
     }
 }

@@ -6,21 +6,15 @@ description = "Gerenciador de sessões do Claude Code e do Codex (aqui e numa VP
 license = "GPL-3.0-only"
 
 [dependencies]
-alacritty_terminal = "0.25.1"
-cosmic-text = { version = "0.19", features = ["monospace_fallback", "shape-run-cache"] }
-indexmap = "2"
+async-channel = "2"
+gtk4 = { version = "0.11", features = ["v4_18"] }
 log = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"
 serde_json = "1"
-tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt", "time"] }
+tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt", "rt-multi-thread", "time"] }
 uuid = { version = "1", features = ["v4"] }
-
-[dependencies.libcosmic]
-git = "https://github.com/pop-os/libcosmic"
-rev = "03d7dcb832bc6d15bc1bb07327a1aa426b2d5bc0"
-default-features = false
-features = ["winit", "tokio", "wayland", "wgpu", "multi-window", "dbus-config", "xdg-portal", "single-instance"]
+vte4 = { version = "0.10", features = ["v0_78"] }
 
 [profile.release]
 lto = "thin"

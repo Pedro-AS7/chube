@@ -12,6 +12,35 @@ herdadas do ambiente ao iniciar os chats.
 Até 2026-11-13 era um app do COSMIC/GNOME, com 9 temas próprios e uma extensão do GNOME para o desfoque; a migração para o
 Omarchy (branch `omarchy`) trocou isso pelo tema do Omarchy e acrescentou o agente do Omarchy e as sessões da VPS.
 
+## Migração para GTK4 + VTE (branch `gtk`, em andamento desde 2026-11-14)
+
+**Por quê:** no libcosmic (iced), cada evento de mouse custa CPU fixa e cada mudança de hover redesenha a janela inteira,
+inclusive o texto dos terminais. Medido com um mouse virtual (uinput, 4 s de movimento, ticks de CPU): libcosmic ~38,
+ptimer (libcosmic mínimo) 27, protótipo GTK4 + VTE 13–18, C-hub GTK da etapa 1 19–27. O GTK só redesenha o que mudou.
+Trocar só para o iced original não resolveria (mesma arquitetura).
+
+**Como ficou (etapa 1):** `app.rs` guarda o estado e trata `Message`s (`App::update` → `Task`); `ui.rs` monta os widgets e,
+depois de cada mensagem, `Ui::sync` os deixa iguais ao estado. Os terminais são `vte4::Terminal` (`terminal.rs`), um por
+chat e por aba, nunca recriados: viram páginas de `gtk::Stack`. As tarefas (`task.rs`) rodam num runtime do tokio e voltam
+pelo canal do laço principal. A instância única é a do `GApplication` (`HANDLES_COMMAND_LINE`): a linha de comando de uma
+segunda chamada chega à janela aberta, com os caminhos relativos resolvidos na pasta de quem chamou (`cli::parse_in`).
+Os atalhos são lidos na fase de captura da janela (`shortcuts::find`, com GDK), antes do VTE. `src/term/` (cosmic-term) saiu.
+
+**Já funciona:** lista agrupada com hover, seleção, fechar (SIGHUP no agente), reabrir encerrado, chat novo na pasta do chat
+em foco (Ctrl+Shift+N), restauração de `chats.json` com chats em espera, status/título/contexto/modelo/modo pelo poll e pelo
+título (termprop `xterm.title`), abas do terminal com o nome da pasta do shell, esconder/mostrar seções, Ctrl+Tab, tema do
+Omarchy (CSS gerado da paleta + cores e fonte nos VTE, relido quando o tema muda), fundo translúcido.
+
+**Falta portar (o `app.rs` antigo está na branch `omarchy`):** painel de nova sessão (agente, lugar, pasta, seletor de
+pasta), sessões salvas, sub-chat, abrir no terminal do Omarchy, seletor de modo, painel "uso" (limites, `/usage`,
+`/context`), VPS (lista, attach, encerrar, `remote::poll` já sem iced), fundo das mensagens do `claude` recolorido pelo tema
+(o VTE não remapeia cor RGB; o `claude` pinta a faixa com cor fixa), `install.sh` e `.desktop` (dependências `gtk4` e `vte4`).
+O `#![allow(dead_code)]` do `main.rs` sai quando tudo voltar a ser usado.
+
+**Testar sem mexer no app aberto:** `XDG_STATE_HOME=<pasta> dbus-run-session -- target/release/chube`, com o link
+`<pasta>/omarchy` → `~/.local/state/omarchy`. O `dbus-run-session` separa a instância única; ao fechar, a cópia do
+`xdg-desktop-portal-hyprland` dessa sessão cai e gera uma notificação de crash (inofensiva).
+
 Rascunho da interface: `chub_racunho.png` (na raiz).
 
 Projeto em português (Brasil). Comentários e UI em PT-BR; identificadores de código em inglês.

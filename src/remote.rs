@@ -193,26 +193,21 @@ pub struct RemoteStatus {
 }
 
 /// Resultado de uma leitura de estado de um host: a lista ou, quando a conexão caiu ou foi negada,
-/// o erro (depois do erro, o stream termina).
+/// o erro (depois do erro, a leitura termina).
 pub type PollItem = (String, Result<Vec<RemoteStatus>, String>);
 
 /// Estado dos chats do Claude Code de um host, por uma conexão SSH só (uma confirmação da chave):
-/// lá, um laço lê todas as sessões do tmux a cada 3 s e manda o resultado. A conexão fecha quando
-/// o stream é descartado (a assinatura sai do app).
-pub fn poll_stream(host: &String) -> impl cosmic::iced::futures::Stream<Item = PollItem> + use<> {
-    let host = host.clone();
-    cosmic::iced::stream::channel(4, async move |mut output| {
-        use cosmic::iced::futures::SinkExt;
-        let error = poll_connection(&host, &mut output).await;
+/// lá, um laço lê todas as sessões do tmux a cada 3 s e manda o resultado a `output`. Termina com
+/// o erro quando a conexão cai ou é negada, ou em silêncio quando `output` é fechado (o app não
+/// precisa mais do host); nos dois casos o `ssh` morre junto (`kill_on_drop`).
+pub async fn poll(host: String, output: async_channel::Sender<PollItem>) {
+    let error = poll_connection(&host, &output).await;
+    if !error.is_empty() {
         let _ = output.send((host, Err(error))).await;
-    })
+    }
 }
 
-async fn poll_connection(
-    host: &str,
-    output: &mut cosmic::iced::futures::channel::mpsc::Sender<PollItem>,
-) -> String {
-    use cosmic::iced::futures::SinkExt;
+async fn poll_connection(host: &str, output: &async_channel::Sender<PollItem>) -> String {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
     let child = tokio::process::Command::new("ssh")

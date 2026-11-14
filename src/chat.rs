@@ -1,14 +1,16 @@
+use std::cell::Cell;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::rc::Rc;
 
-use cosmic::widget::text_editor;
+use vte4::prelude::*;
 
 use crate::agent::Agent;
 use crate::claude::{self, Mode, Start};
-use crate::commands::Command;
 use crate::restore::OpenChat;
 use crate::sessions::SavedSession;
-use crate::term::{self, Terminal};
+
+/// Numeração única dos terminais do app: chats e abas do terminal integrado.
+pub type TermId = u64;
 
 /// `session_id` gravado de um chat que só entra num tmux aberto fora do Chube.
 pub const TMUX_ID_PREFIX: &str = "tmux:";
@@ -64,7 +66,7 @@ pub struct Chat {
     pub context_window: Option<u32>,
     pub codex_limits: Vec<crate::usage::Limit>,
     /// Identifica o chat e os eventos do terminal dele (mesma numeração das abas do terminal).
-    pub id: term::TabId,
+    pub id: TermId,
     pub cwd: PathBuf,
     pub model: Option<String>,
     pub start: Start,
@@ -79,15 +81,13 @@ pub struct Chat {
     /// Modelo usado de fato, lido do histórico da sessão.
     pub active_model: Option<String>,
     pub context_tokens: u32,
-    /// `None` até o canal de eventos do terminal existir ou se o `claude` não abriu.
-    pub terminal: Option<Mutex<Terminal>>,
-    /// Texto do campo de mensagem abaixo do terminal.
-    pub composer: text_editor::Content<cosmic::Renderer>,
+    /// Terminal (VTE) rodando o agente; `None` enquanto o chat está em espera.
+    pub terminal: Option<vte4::Terminal>,
+    /// Pid do processo do terminal, conhecido quando o VTE termina de abri-lo.
+    pub pid: Rc<Cell<Option<u32>>>,
     /// Modo de permissão lido na tela; `None` até aparecer no rodapé da TUI.
     pub mode: Option<Mode>,
     pub mode_change: Option<ModeChange>,
-    /// Comandos `/…` sugeridos no campo; carregados na primeira `/`.
-    pub commands: Option<Vec<Command>>,
 }
 
 /// Troca de modo em andamento: um Shift+Tab por vez até a tela mostrar o modo pedido.
@@ -101,7 +101,7 @@ pub struct ModeChange {
 }
 
 impl Chat {
-    pub fn new(id: term::TabId, agent: Agent, cwd: PathBuf, model: Option<String>, prompt: Option<String>) -> Self {
+    pub fn new(id: TermId, agent: Agent, cwd: PathBuf, model: Option<String>, prompt: Option<String>) -> Self {
         let session_id = uuid::Uuid::new_v4().to_string();
         Self::with_start(
             id,
@@ -118,7 +118,7 @@ impl Chat {
     }
 
     /// Retoma uma sessão salva; o histórico aparece no próprio Claude Code.
-    pub fn resume(id: term::TabId, saved: &SavedSession, model: Option<String>) -> Self {
+    pub fn resume(id: TermId, saved: &SavedSession, model: Option<String>) -> Self {
         let mut chat = Self::with_start(
             id,
             saved.agent,
@@ -137,7 +137,7 @@ impl Chat {
     /// Chat aberto na última execução, em espera até ser selecionado. Sem o `.jsonl` (sessão
     /// sem nenhuma mensagem, ou apagada pelo Claude Code), o `--resume` falharia: volta como
     /// chat novo na mesma pasta.
-    pub fn restore(id: term::TabId, open: &OpenChat, saved: bool) -> Self {
+    pub fn restore(id: TermId, open: &OpenChat, saved: bool) -> Self {
         let attach_only = open.session_id.starts_with(TMUX_ID_PREFIX);
         let mut chat = if saved && !attach_only {
             let mut chat = Self::with_start(
@@ -170,7 +170,7 @@ impl Chat {
     }
 
     /// Entra numa sessão do tmux da VPS aberta fora do Chube.
-    pub fn attach(id: term::TabId, host: String, tmux: String, cwd: PathBuf, title: String) -> Self {
+    pub fn attach(id: TermId, host: String, tmux: String, cwd: PathBuf, title: String) -> Self {
         let mut chat = Self::new(id, Agent::Claude, cwd, None, None);
         chat.session_id = None;
         chat.title = title;
@@ -238,7 +238,7 @@ impl Chat {
     }
 
     /// Sub-chat: nova sessão que começa com todo o contexto desta.
-    pub fn fork(&self, id: term::TabId) -> Option<Self> {
+    pub fn fork(&self, id: TermId) -> Option<Self> {
         let parent_session_id = self.session_id.clone()?;
         let mut chat = Self::with_start(
             id,
@@ -259,7 +259,7 @@ impl Chat {
     }
 
     /// Abre de novo uma sessão encerrada, no mesmo lugar da lista.
-    pub fn reopen(&self, id: term::TabId) -> Option<Self> {
+    pub fn reopen(&self, id: TermId) -> Option<Self> {
         let Some(session_id) = self.session_id.clone() else {
             let mut chat = Self::new(id, self.agent, self.cwd.clone(), self.model.clone(), None);
             chat.auto = self.auto;
@@ -294,7 +294,7 @@ impl Chat {
     }
 
     fn with_start(
-        id: term::TabId,
+        id: TermId,
         agent: Agent,
         cwd: PathBuf,
         model: Option<String>,
@@ -323,10 +323,9 @@ impl Chat {
             active_model: None,
             context_tokens: 0,
             terminal: None,
-            composer: text_editor::Content::new(),
+            pid: Rc::new(Cell::new(None)),
             mode: None,
             mode_change: None,
-            commands: None,
         }
     }
 
@@ -340,39 +339,56 @@ impl Chat {
     }
 
     /// Manda bytes ao `claude`, como teclas digitadas no terminal.
-    pub fn send(&self, bytes: impl Into<Vec<u8>>) {
-        if let Some(Ok(terminal)) = self.terminal.as_ref().map(Mutex::lock) {
-            terminal.input_scroll(bytes.into());
+    pub fn send(&self, bytes: &[u8]) {
+        if let Some(terminal) = &self.terminal {
+            terminal.feed_child(bytes);
         }
     }
 
     /// Cola o texto no `claude` (bracketed paste: quebras de linha não enviam a mensagem).
-    pub fn paste(&self, text: String) {
-        if let Some(Ok(terminal)) = self.terminal.as_ref().map(Mutex::lock) {
-            terminal.paste(text);
+    pub fn paste(&self, text: &str) {
+        if let Some(terminal) = &self.terminal {
+            terminal.paste_text(text);
         }
     }
 
     /// Relê o modo no rodapé da TUI; mantém o anterior se o rodapé não está na tela.
     pub fn read_mode(&mut self) {
-        if self.agent != Agent::Claude { return; }
-        let Some(Ok(terminal)) = self.terminal.as_ref().map(Mutex::lock) else {
+        if self.agent != Agent::Claude {
+            return;
+        }
+        let Some(text) = self.terminal.as_ref().and_then(|terminal| terminal.text_format(vte4::Format::Text)) else {
             return;
         };
-        if let Some(mode) = Mode::from_screen(&term::screen_tail(&terminal, 4)) {
+        if let Some(mode) = Mode::from_screen(&screen_tail(&text, 4)) {
             self.mode = Some(mode);
         }
     }
 
     /// Pid do `claude` deste chat.
     pub fn pid(&self) -> Option<u32> {
-        self.terminal.as_ref()?.lock().ok()?.pid()
+        self.pid.get()
     }
+}
+
+/// As últimas `count` linhas da tela, sem as linhas vazias do fim (o VTE devolve a tela inteira,
+/// e abaixo do rodapé da TUI pode sobrar espaço).
+pub fn screen_tail(text: &str, count: usize) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let end = lines.iter().rposition(|line| !line.trim().is_empty()).map_or(0, |last| last + 1);
+    lines[end.saturating_sub(count)..end].iter().map(|line| (*line).to_owned()).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fim_da_tela_sem_linhas_vazias() {
+        let text = "a\nb\n⏵⏵ auto mode on (shift+tab to cycle)\n\n  \n";
+        assert_eq!(screen_tail(text, 2), vec!["b", "⏵⏵ auto mode on (shift+tab to cycle)"]);
+        assert!(screen_tail("", 4).is_empty());
+    }
 
     #[test]
     fn codex_session_keeps_its_agent_when_restored_forked_and_reopened() {
