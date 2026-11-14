@@ -14,7 +14,27 @@ pub struct Builtin {
 /// Tema usado fora do Omarchy quando nada foi escolhido.
 pub const DEFAULT: &str = "tokyo-night";
 
-pub const BUILTINS: [Builtin; 5] = [
+pub const BUILTINS: [Builtin; 6] = [
+    Builtin {
+        id: "escuro",
+        name: "Escuro",
+        // Básico: cinza escuro neutro, sem tom de cor no fundo, e um acento azul discreto.
+        colors: ThemeColors {
+            light: false,
+            accent: 0x6ca0dc,
+            selection: 0x3a3a3a,
+            muted: 0x8a8a8a,
+            background: 0x1e1e1e,
+            lighter_background: 0x2a2a2a,
+            foreground: 0xd4d4d4,
+            bright_foreground: 0xffffff,
+            ansi: [
+                0x2e2e2e, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xd4d4d4, //
+                0x5c5c5c, 0xef8f97, 0xb5dd96, 0xf0d197, 0x8cc5f5, 0xd9a0e8, 0x7fcfd8, 0xffffff,
+            ],
+            opacity: 1.0,
+        },
+    },
     Builtin {
         id: "tokyo-night",
         name: "Tokyo Night",
