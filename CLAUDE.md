@@ -10,7 +10,7 @@ integrado com abas**. O visual segue o tema do Omarchy em uso. Usa o login exist
 herdadas do ambiente ao iniciar os chats.
 
 Até 2026-11-13 era um app do COSMIC/GNOME, com 9 temas próprios e uma extensão do GNOME para o desfoque; a migração para o
-Omarchy (branch `omarchy`) trocou isso pelo tema do Omarchy e acrescentou o agente do Omarchy e as sessões da VPS.
+Omarchy (antes na branch `omarchy`, juntada ao `main` em 2026-11-14) trocou isso pelo tema do Omarchy e acrescentou o agente do Omarchy e as sessões da VPS.
 
 ## Migração para GTK4 + VTE (2026-11-14)
 

@@ -1,2 +1,5 @@
 target/
 .claude/
+
+# backups locais (arquivo.antes-<motivo>)
+*.antes-*
